@@ -83,12 +83,22 @@ def poison_new_index_scales(pages: torch.Tensor, slots: torch.Tensor) -> None:
 
 
 def launch_scores(runtime, rows: int) -> torch.Tensor:
-    """The launch's index scores as f32 bits, int32 [rows, index_max_seq]: the value
-    words of the (value, tag) pairs in the runtime's scratch."""
+    """Read the value words of index-score pairs across every launch row tile."""
     n = runtime.key.index_max_seq
-    at = runtime.sc["index_scores"]
-    pairs = runtime.scratch[at : at + rows * n * 8].view(torch.int32)
-    return pairs.view(rows, n, 2)[..., 0]
+    tile = runtime.sc.get("_tile_rows", runtime.width)
+    parts = []
+    for start in range(0, rows, tile):
+        count = min(tile, rows - start)
+        at = runtime.sc["index_scores"] + (start // tile) * runtime.sc.get(
+            "_tile_stride", 0
+        )
+        values = (
+            runtime.scratch[at : at + count * n * 8]
+            .view(torch.int32)
+            .view(count, n, 2)[..., 0]
+        )
+        parts.append(values)
+    return torch.cat(parts)
 
 
 def _radix_keys(bits: torch.Tensor) -> torch.Tensor:

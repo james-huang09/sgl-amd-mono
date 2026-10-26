@@ -44,6 +44,26 @@ class Glm53Build(msgspec.Struct, frozen=True):
     fault_site: int = 0
     fault_after: int = 0
     stop: bool = True
+    expert_mxfp4: bool = False
+    moe_activation_dtype: str = "fp8"
+
+    def __post_init__(self):
+        if not 1 <= self.rows <= 16:
+            raise ValueError("GLM supports 1 to 16 physical rows")
+        if not self.expert_mxfp4 and self.rows in (13, 14, 15):
+            raise ValueError("A8W8 needs 1-12 or 16 physical rows; pad 13-15 to 16")
+        if self.rows > 12 and self.tp != 4:
+            raise ValueError("tiled GLM schedules require TP4")
+        if self.moe_activation_dtype not in ("fp8", "fp4"):
+            raise ValueError("moe_activation_dtype must be fp8 or fp4")
+        if self.moe_activation_dtype == "fp4" and not self.expert_mxfp4:
+            raise ValueError("A4W4 requires MXFP4 expert weights")
+        if self.expert_mxfp4 and self.moe_activation_dtype != "fp4":
+            raise ValueError(
+                "MXFP4 experts require FP4 activations; A8W4 is unsupported"
+            )
+        if self.expert_mxfp4 and self.tp != 4:
+            raise ValueError("SGL native MXFP4 is supported at TP4")
 
     @property
     def heads(self) -> int:
@@ -84,6 +104,7 @@ class Glm53Weights(msgspec.Struct, frozen=True):
     shuffled: bool
     index: Optional[torch.Tensor] = None
     keep: tuple = ()
+    expert_mxfp4: bool = False
 
 
 class Glm53Caches(msgspec.Struct, frozen=True):
@@ -151,6 +172,9 @@ class Glm53Runtime:
 
         ensure_writable_flydsl_cache()
         self.key, self.width, self.rank = key, key.rows, rank
+        if key.tp == 4 and key.rows >= 8:
+            if torch.cuda.get_device_properties(device).multi_processor_count != 256:
+                raise ValueError("the wide GLM schedule requires a full 256-CU MI355X")
         self.kv_dtype = torch.float8_e4m3fn if key.kv_fp8 else torch.bfloat16
         self.sc, self.sy = layout(
             key.rows,
@@ -161,6 +185,7 @@ class Glm53Runtime:
             key.index_max_seq,
             inter=key.inter,
             output_heads=key.heads,
+            native_fp4_mfma=key.expert_mxfp4,
         )
         self.launch = build_glm5_monokernel(
             key.rows,
@@ -176,7 +201,10 @@ class Glm53Runtime:
             inter=key.inter,
             output_heads=key.heads,
             uv_scale_rows=128,
-            # the other layers read the top-k buffer, not the index cache
+            expert_mxfp4=key.expert_mxfp4,
+            atom_experts=key.expert_mxfp4,
+            native_fp4_mfma=key.expert_mxfp4,
+            moe_activation_dtype=key.moe_activation_dtype,
             index_paged=key.with_indexer,
             index_block_size=INDEX_PAGE_TOKENS,
             index_block_bytes=INDEX_PAGE_BYTES,
@@ -224,9 +252,14 @@ def _check(name: str, t: torch.Tensor, shape: tuple, dtype: torch.dtype) -> None
 
 
 class Glm53LayerOp:
-    """One covered layer: its weights and its ordinal among its kind's layers."""
+    """One covered layer's weights and ordinal among its kind's layers."""
 
-    def __init__(self, runtime: Glm53Runtime, weights: Glm53Weights, layer: int):
+    def __init__(
+        self,
+        runtime: Glm53Runtime,
+        weights: Glm53Weights,
+        layer: int,
+    ):
         key = runtime.key
         if (weights.index is not None) != key.with_indexer:
             raise ValueError("an indexer runtime needs indexer weights, and only it")
@@ -235,6 +268,24 @@ class Glm53LayerOp:
                 f"weights with shuffled={weights.shuffled} on a runtime with "
                 f"fp8_shuffled={key.fp8_shuffled}"
             )
+        if getattr(weights, "expert_mxfp4", False) != key.expert_mxfp4:
+            raise ValueError("expert weight format does not match the compiled runtime")
+        if key.expert_mxfp4:
+            for name, count in (
+                ("w_ug", 257 * 2 * key.inter * HIDDEN // 2),
+                ("w_dn", 257 * HIDDEN * key.inter // 2),
+                ("s_ug", 257 * 2 * key.inter * HIDDEN // 32),
+                ("s_dn", 257 * HIDDEN * key.inter // 32),
+            ):
+                tensor = getattr(weights, name)
+                if (
+                    tensor.dtype != torch.uint8
+                    or tensor.numel() != count
+                    or not tensor.is_contiguous()
+                ):
+                    raise ValueError(
+                        f"MXFP4 {name} needs {count} contiguous uint8 elements"
+                    )
         self.rt, self.w, self.layer = runtime, weights, layer
 
     def launch(
@@ -247,7 +298,10 @@ class Glm53LayerOp:
     ) -> torch.Tensor:
         """The previous layer's hidden stream ``h`` [W, HIDDEN] in; this layer's out
         (h plus its attention and MoE)."""
-        rt, w, W = self.rt, self.w, self.rt.width
+        return self._launch(self.rt, h, caches, cos, sin, step)
+
+    def _launch(self, rt, h, caches, cos, sin, step):
+        w, W = self.w, rt.width
         _check("h", h, (W, HIDDEN), torch.bfloat16)
         _check("positions", step.positions, (W,), torch.int64)
         _check("slots", step.slots, (W,), torch.int64)

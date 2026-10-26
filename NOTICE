@@ -38,3 +38,10 @@ Portions are adapted from ROCm/aiter (https://github.com/ROCm/aiter): the GLM-5.
 decoder-layer kernel of ROCm/aiter#6173 (Copyright (c) 2025 FlyDSL Project
 Contributors). Each adapted file names its origin in its header. These portions
 are distributed under the Apache License 2.0.
+
+The GLM-5.3 batched query reads, paged KV row addressing/gathers,
+row/cohort scheduling, shared input normalization and projections,
+latent reuse, grouped expert scheduling and owner reductions are adapted
+from ROCm/FlyDSL (https://github.com/ROCm/FlyDSL), PR #1256 at
+032072c94064, Copyright (c) 2025 FlyDSL Project Contributors,
+distributed under the Apache License 2.0.

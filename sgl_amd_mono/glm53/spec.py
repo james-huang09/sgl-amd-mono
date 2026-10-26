@@ -52,21 +52,24 @@ except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
 from sgl_amd_mono.common.plan import BLOCKS
 from sgl_amd_mono.glm53 import HF_CONFIG
 
-# kernel widths; a step of fewer rows runs at the next width, the rest pad rows (a
-# one-row launch never completes on gfx950)
-WIDTHS = (2, 4, 8)
+# A8W8 padding buckets. Native FP4 uses exact widths through 12; both formats
+# retain the 16-row cohort bucket for 13-16 logical tokens.
+WIDTHS = (2, 4, 6, 8, 12, 16)
 ROWS = tuple(range(1, max(WIDTHS) + 1))
 TP_SIZES = (4, 8)
-# the rows a step runs on the kernels at most at this TP size: on MI355X an 8-row
-# launch at TP4 is slower than the model's forward, so wider steps run that
-TP_MAX_ROWS = {4: 4}
+# TP4 uses the bounded row/cohort schedule through sixteen total query tokens.
+# Retain the existing TP8 support range; this port is validated at TP4.
+TP_MAX_ROWS = {4: 16, 8: 8}
 # SGLang's DSA cache on ROCm: 64-token pages
 PAGE_SIZE = 64
 TOPK = 2048
 
 
-def _width(rows: int) -> int:
-    return next(w for w in WIDTHS if w >= rows)
+def _width(rows: int, tp: int = 4, expert_mxfp4: bool = False) -> int:
+    if expert_mxfp4 and tp == 4 and rows <= 12:
+        return rows
+    widths = (2, 4, 8) if tp == 8 else WIDTHS
+    return next(w for w in widths if w >= rows)
 
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
@@ -90,6 +93,7 @@ SGLANG_READS = {
     "srt/configs/model_config.py": ("context_len",),
     "srt/layers/attention/dsa/dsa_indexer.py": ("use_gfx950_fused_indexer",),
     "srt/layers/attention/dsa_backend.py": ("forward_metadata", "real_page_table"),
+    "srt/layers/aux_hidden_states.py": ("AuxHiddenStatePacker", "capture", "finalize"),
     "srt/layers/layer_boundary/__init__.py": ("get_attn_tp_context",),
     "srt/layers/layer_boundary/adapters/attention.py": ("maybe_input_scattered",),
     "srt/layers/layer_boundary/residual/batch.py": (
@@ -123,9 +127,11 @@ SGLANG_READS = {
         "indexer",
         "gemm_output_zero_allocator_size",
         "next_full_attention_layer_id",
+        "layers_to_capture",
         "logits_processor",
         "lm_head",
         "forward(prev_topk_indices)",
+        "forward(captured_last_layer_outputs)",
     ),
     "kernels/plugin_kernels/amd/spec.py|srt/monokernels/spec.py": (
         "DeviceLimits",
@@ -190,17 +196,25 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
     if cfg.page_size not in (None, PAGE_SIZE):
         reasons.append(f"--page-size {cfg.page_size}: the DSA caches need {PAGE_SIZE}")
     # a verify row sees the keys up to its own position: one draft chain per request
-    if cfg.speculative_algorithm is not None and (
+    if getattr(cfg, "speculative_algorithm", None) is not None and (
         cfg.speculative_eagle_topk != 1
         or cfg.speculative_num_draft_tokens != cfg.speculative_num_steps + 1
     ):
         reasons.append("MTP verifies one draft chain: topk 1, draft tokens = steps + 1")
+    if (
+        getattr(cfg, "speculative_algorithm", None) is None
+        and getattr(cfg, "speculative_eagle_topk", 1) != 1
+    ):
+        reasons.append("requires a linear speculative chain (topk 1)")
     quant = getattr(hf_config, "quantization_config", None) or {}
-    if quant.get("quant_method") != "fp8" or list(
+    block_fp8 = quant.get("quant_method") == "fp8" and list(
         quant.get("weight_block_size") or ()
-    ) != [128, 128]:
+    ) == [128, 128]
+    # Quark supports per-layer formats. Check actual loaded projections and
+    # expert tensors below; its name alone does not imply a compatible layout.
+    if not block_fp8 and quant.get("quant_method") != "quark":
         reasons.append(
-            "needs the FP8 block-128 checkpoint, got "
+            "needs FP8 block-128 or Quark with block-FP8 attention, got "
             f"{quant.get('quant_method')!r} {quant.get('weight_block_size')!r}"
         )
     if importlib.util.find_spec("flydsl") is None:
@@ -215,6 +229,7 @@ def _where(ids: list) -> str:
 def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
     from sgl_amd_mono.glm53.gfx950.weights import (
         experts_reason,
+        projection_format_reasons,
         unshuffled_projections,
     )
 
@@ -226,6 +241,7 @@ def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
         why = experts_reason(layer.mlp)
         if why is not None:
             reasons.append(f"layer {i}: {why}")
+        reasons.extend(f"layer {i}: {why}" for why in projection_format_reasons(layer))
         for name in unshuffled_projections(layer):
             row_major.setdefault(name, []).append(i)
         indexer = layer.self_attn.indexer
@@ -274,6 +290,12 @@ class _Built:
         self.lm, self.model = lm, lm.model
         self._layers, self.runtimes = layers, runtimes
         self.first, self.last = min(layers), max(layers)
+        self.tp = tp
+        self.moe_activation_dtype = (
+            "fp4"
+            if getattr(getattr(layers[self.first], "w", None), "expert_mxfp4", False)
+            else "fp8"
+        )
         self.max_rows = TP_MAX_ROWS.get(tp, max(WIDTHS))
         self.max_position = context_len - 1
         self.check_layers = os.environ.get("SGLANG_AMD_MONO_CHECK") == "1"
@@ -301,8 +323,26 @@ class _Built:
         forward_batch,
         input_embeds=None,
         pp_proxy_tensors=None,
+        *,
+        moe_activation_dtype: str | None = None,
     ):
-        """``DeepseekV2ForCausalLM.forward`` for a routed decode or verify step."""
+        """Run a decode or verify step with the loaded expert activation format.
+
+        ``moe_activation_dtype=None`` follows the loaded expert weights: FP8
+        for A8W8 and FP4 for A4W4. An explicit value must match that format;
+        forward does not convert weights or build a different quantization path.
+        """
+        dtype = getattr(self, "moe_activation_dtype", "fp8")
+        if moe_activation_dtype is not None:
+            if type(moe_activation_dtype) is not str or moe_activation_dtype not in (
+                "fp8",
+                "fp4",
+            ):
+                raise ValueError("moe_activation_dtype must be fp8 or fp4")
+            if moe_activation_dtype != dtype:
+                raise ValueError(
+                    f"loaded experts require {dtype} activations; only A8W8 and A4W4 are supported"
+                )
         lm = self.lm
         if plan.key.rows > self.max_rows:
             return type(lm).forward(
@@ -311,14 +351,15 @@ class _Built:
         from sglang.srt.layers.layer_boundary import get_attn_tp_context
 
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
-            hidden = self._backbone(
+            hidden, aux = self._backbone(
                 plan, input_ids, positions, forward_batch, input_embeds
             )
-        return lm.logits_processor(input_ids, hidden, lm.lm_head, forward_batch, None)
+        return lm.logits_processor(input_ids, hidden, lm.lm_head, forward_batch, aux)
 
     def _backbone(self, plan, input_ids, positions, forward_batch, input_embeds):
         """``DeepseekV2Model.forward``: the embedding and dense layers on SGLang's
         path, the covered ones as launches, then the final norm."""
+        from sglang.srt.layers.aux_hidden_states import AuxHiddenStatePacker
         from sglang.srt.layers.layer_boundary.residual.batch import (
             complete_output,
             final_norm,
@@ -327,6 +368,8 @@ class _Built:
         from sglang.srt.utils.common import BumpAllocator
 
         m = self.model
+        capture_layers = getattr(m, "layers_to_capture", ())
+        aux = AuxHiddenStatePacker(len(capture_layers))
         hidden = m.embed_tokens(input_ids) if input_embeds is None else input_embeds
         start(forward_batch)
         zero = BumpAllocator(
@@ -346,7 +389,13 @@ class _Built:
             L = self._layers.get(i)
             if L is not None:
                 hidden = self._layer(
-                    L, plan, positions, hidden, forward_batch, topk_indices
+                    L,
+                    plan,
+                    positions,
+                    hidden,
+                    forward_batch,
+                    topk_indices,
+                    aux if i in capture_layers else None,
                 )
                 topk_indices = None
                 continue
@@ -358,14 +407,17 @@ class _Built:
                 gemm_zero,
                 None,
                 prev_topk_indices=topk_indices,
+                captured_last_layer_outputs=aux if i in capture_layers else None,
                 next_full_attention_layer_id=m.next_full_attention_layer_id.get(i),
             )
         hidden = complete_output(hidden, forward_batch)
         if not forward_batch.forward_mode.is_idle():
             hidden = final_norm(hidden, forward_batch, m.norm)
-        return hidden
+        return hidden, aux.finalize() if len(aux) else None
 
-    def _layer(self, L: _Layer, plan, positions, hidden, forward_batch, topk_indices):
+    def _layer(
+        self, L: _Layer, plan, positions, hidden, forward_batch, topk_indices, aux=None
+    ):
         """The stream the previous layer wrote (the first covered layer) or the
         previous launch's output in; the launch's output, or the written stream
         after the last covered layer."""
@@ -376,7 +428,7 @@ class _Built:
         )
 
         S = plan.key.rows
-        W = _width(S)
+        W = _width(S, self.tp, getattr(L.w, "expert_mxfp4", False))
         step = self._step(plan, positions, forward_batch, S, W)
         if L.i == self.first:
             # layer 2's output still owes its residual add (to the next input norm)
@@ -390,6 +442,10 @@ class _Built:
                 self._take_topk(topk_indices, step, S, W)
         else:
             h = hidden
+        if aux is not None:
+            # SGLang captures the input residual before this layer's norm.
+            # Copy now: subsequent launches reuse the same output arenas.
+            aux.capture(h[:S])
         self._bind(L, kv_dtype=L.ops[W].rt.kv_dtype)
         checking = self.check_layers and not torch.cuda.is_current_stream_capturing()
         if checking:
@@ -405,16 +461,20 @@ class _Built:
         if checking:
             scores = None
             if L.w.index is not None:
-                scores = check.launch_scores(L.ops[W].rt, S)
+                op = L.ops[W]
+                scores = check.launch_scores(op.rt, S)
             check.compare(
                 L, ref, out[:S], positions, forward_batch, S, step=step, scores=scores
             )
         if L.i != self.last:
             return out
-        for (w, _), rt in self.runtimes.items():
-            if w == W:
-                rt.advance_step()
+        self._advance_step(W)
         return set_written(out[:S], forward_batch)
+
+    def _advance_step(self, width: int) -> None:
+        """Only runtimes launched by this forward consume an epoch."""
+        for kind in ("index", "shared"):
+            self.runtimes[width, kind].advance_step()
 
     def _take_topk(self, topk_indices, step, S: int, W: int) -> None:
         """Layer 2's top-k (SGLang's [S, 2048] KV slots, -1 past each row's keys)
@@ -490,9 +550,15 @@ class _Built:
             st.req_ids[:S] = torch.arange(S, dtype=torch.int32, device=loc.device)
             st.req_ids[S:] = 0
             md = get_attn_backend().forward_metadata
-            plan.state["step"] = msgspec.structs.replace(
-                st, page_table=md.real_page_table[:S]
-            )
+            page_table = md.real_page_table
+            if page_table.shape[0] < S:
+                requests = plan.key.batch_size
+                if page_table.shape[0] < requests:
+                    raise ValueError("GLM page table does not cover every request")
+                st.req_ids[:S] = torch.arange(
+                    requests, dtype=torch.int32, device=loc.device
+                ).repeat_interleave(plan.key.tokens_per_request)
+            plan.state["step"] = msgspec.structs.replace(st, page_table=page_table[:S])
         return plan.state["step"]
 
 
@@ -542,8 +608,12 @@ def _build(model, hf_config, ctx) -> _Built:
     # the keys an indexer row scores at most: the served context's, in whole tasks
     tasks = -(-context_len // INDEX_KEYS_PER_TASK)
     max_seq = tasks * INDEX_KEYS_PER_TASK
+    formats = {getattr(L.w, "expert_mxfp4", False) for L in layers.values()}
+    if len(formats) != 1:
+        raise ValueError("covered GLM layers must use one expert weight format")
+    expert_mxfp4 = formats.pop()
     cap = TP_MAX_ROWS.get(tp, max(WIDTHS))
-    widths = sorted({_width(r) for r in ctx.widths if r <= cap})
+    widths = sorted({_width(r, tp, expert_mxfp4) for r in ctx.widths if r <= cap})
     if not widths:
         raise ValueError(
             f"GLM-5.3 monokernel: TP{tp} runs at most {cap} rows on the kernels, and "
@@ -558,23 +628,24 @@ def _build(model, hf_config, ctx) -> _Built:
                 tp=tp,
                 launches_per_step=len(ids),
                 with_indexer=kind == "index",
-                # an unpaged launch keeps index_max_seq words in LDS
                 index_max_seq=max_seq if kind == "index" else 0,
                 fp8_shuffled=fp8_shuffled,
                 kv_fp8=kv_fp8,
                 fault_site=fault_site,
                 fault_after=fault_after,
+                expert_mxfp4=expert_mxfp4,
+                moe_activation_dtype="fp4" if expert_mxfp4 else "fp8",
             )
             rt = Glm53Runtime(key, rank, p.tp_group.cpu_group, device)
             rt.set_deadline(ctx.deadline_s)
             runtimes[w, kind] = rt
             for n, i in enumerate(ids):
-                layers[i].ops[w] = Glm53LayerOp(rt, layers[i].w, n)
+                layers[i].ops[w] = Glm53LayerOp(runtimes[w, kind], layers[i].w, n)
     # Every rank builds every width. FlyDSL's disk cache hands a rank the kernels
     # another rank built (a lock per kernel), so each rank starts at its own share.
     start = len(widths) * rank // tp
     for w in widths[start:] + widths[:start]:
-        for kind in kinds:
+        for kind in ("index", "shared"):
             runtimes[w, kind].precompile()
     return _Built(
         model, layers, runtimes, cos, sin, tp, device, context_len=context_len

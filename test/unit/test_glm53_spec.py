@@ -85,15 +85,35 @@ def _built(lm, layers, runtimes, tp=8, context_len=202752):
     )
 
 
-def test_a_step_runs_at_the_next_width_and_tp4_takes_four_rows():
+def test_a_step_runs_at_the_next_width_and_tp4_takes_sixteen_rows():
     # a one-row launch never completes on gfx950: one row runs at width 2
-    assert [glm53._width(r) for r in glm53.ROWS] == [2, 2, 4, 4, 8, 8, 8, 8]
-    # TP4 builds no 8-row launch: a wider step runs the model's own forward
-    runtimes = {(w, k): None for w in (2, 4) for k in ("index", "shared")}
+    assert [glm53._width(r) for r in glm53.ROWS] == [
+        2,
+        2,
+        4,
+        4,
+        6,
+        6,
+        8,
+        8,
+        12,
+        12,
+        12,
+        12,
+        16,
+        16,
+        16,
+        16,
+    ]
+    runtimes = {(w, k): None for w in glm53.WIDTHS for k in ("index", "shared")}
     layers = {i: SimpleNamespace(i=i) for i in range(3, 78)}
     lm = _Lm()
     built = _built(lm, layers, runtimes, tp=4)
-    key = registry.ShapeKey(forward_mode="decode", batch_size=5, tokens_per_request=1)
+    assert built.max_rows == 16
+    assert [glm53._width(r, tp=8) for r in range(1, 9)] == [2, 2, 4, 4, 8, 8, 8, 8]
+    key = registry.ShapeKey(
+        forward_mode="target_verify", batch_size=2, tokens_per_request=9
+    )
     out = built.forward(registry.Plan(key=key), "ids", "positions", "batch")
     assert out == "the model's forward"
     assert lm.ran == [("ids", "positions", "batch", None, None)]
@@ -235,6 +255,20 @@ def test_the_layer_check_poisons_only_this_steps_index_scales():
     assert torch.equal(pages[:, values], before[:, values])
 
 
+def test_speculation_requires_a_linear_chain():
+    assert registry.Feature.SPECULATIVE_DECODING in glm53.SPEC.features
+    assert (
+        glm53._config_disable_reasons(
+            SimpleNamespace(page_size=64, speculative_eagle_topk=1), GLM53
+        )
+        == []
+    )
+    reasons = glm53._config_disable_reasons(
+        SimpleNamespace(page_size=64, speculative_eagle_topk=2), GLM53
+    )
+    assert "linear speculative chain" in " ".join(reasons)
+
+
 def test_config_reasons_name_each_mismatch():
     assert glm53._config_disable_reasons(CFG, GLM53) == []
     other = SimpleNamespace(
@@ -242,7 +276,7 @@ def test_config_reasons_name_each_mismatch():
             **vars(GLM53),
             "index_topk_freq": 8,
             "moe_layer_freq": 2,
-            "quantization_config": {"quant_method": "quark"},
+            "quantization_config": {"quant_method": "int4"},
             "rope_parameters": {"rope_type": "yarn", "factor": 4.0},
         }
     )
@@ -257,12 +291,32 @@ def test_config_reasons_name_each_mismatch():
 
 
 def _linear(shuffled=True):
-    # SGLang marks only the block-FP8 linears it rewrote into AITER's layout
-    if not shuffled:
-        return SimpleNamespace(weight=SimpleNamespace())
     return SimpleNamespace(
-        aiter_bpreshuffled=True, weight=SimpleNamespace(is_shuffled=True)
+        aiter_bpreshuffled=shuffled,
+        weight=torch.empty(256, 256, dtype=torch.float8_e4m3fn, device="meta"),
+        weight_scale_inv=torch.empty(2, 2, device="meta"),
     )
+
+
+def test_quark_config_defers_to_loaded_tensor_formats():
+    cfg = SimpleNamespace(
+        **(vars(GLM53) | {"quantization_config": {"quant_method": "quark"}})
+    )
+    assert glm53._config_disable_reasons(SimpleNamespace(page_size=64), cfg) == []
+
+
+@pytest.mark.parametrize(
+    "dtype, scale",
+    [(torch.uint8, True), (torch.bfloat16, True), (torch.float8_e4m3fn, False)],
+)
+def test_attention_still_requires_block_fp8(dtype, scale):
+    layers = _layers()
+    projection = layers[3].self_attn.q_b_proj
+    projection.weight = torch.empty(256, 256, device="meta", dtype=dtype)
+    if not scale:
+        projection.weight_scale_inv = torch.empty(256, 1, device="meta")
+    reasons = glm53._model_disable_reasons(_model(layers), GLM53, {})
+    assert any("layer 3:" in why and "q_b_proj" in why for why in reasons)
 
 
 def _layer(

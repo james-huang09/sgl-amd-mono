@@ -25,12 +25,13 @@ def test_slices_tile_a_rows_chunks_once_in_position_order(bound):
     assert (n - 1) * per < chunks <= n * per
 
 
-@pytest.mark.parametrize("rows", WIDTHS)
+@pytest.mark.parametrize("rows", [w for w in WIDTHS if w <= 12])
 def test_slice_tasks_fit_half_the_grid_between_score_and_split(rows):
     stages = L.stage_tasks(rows, 8, 2048, with_indexer=True, index_max_seq=1 << 20)
     tasks = dict(stages)
-    assert tasks["index_hist"] == tasks["index_gather"] == rows * L.INDEX_SEL_SLICES
-    assert rows * L.INDEX_SEL_SLICES <= BLOCKS // 2
+    slices = L.index_select_slices(rows)
+    assert tasks["index_hist"] == tasks["index_gather"] == rows * slices
+    assert rows * slices <= BLOCKS // 2
     assert tasks["index_thresh"] == tasks["index_select"] == rows
     order = [name for name, _ in stages]
     chain = [
@@ -44,3 +45,22 @@ def test_slice_tasks_fit_half_the_grid_between_score_and_split(rows):
     assert [order.index(name) for name in chain] == sorted(
         order.index(name) for name in chain
     )
+
+
+@pytest.mark.parametrize("rows", range(1, 17))
+def test_native_parallel_selection_has_disjoint_tile_storage(rows):
+    scratch, symmetric = L.layout(rows, 16, 4, 2048, True, 131072, native_fp4_mfma=True)
+    tile, count = scratch["_tile_rows"], scratch["_tile_count"]
+    slices = L.index_select_slices(tile, count == 2)
+    grid = BLOCKS // (2 if count == 2 else 1)
+    assert tile * slices <= grid // 2
+    for bound in BOUNDS:
+        n, per = L.select_slices(bound, slices)
+        chunks = -(-bound // L.INDEX_SEL_CHUNK)
+        assert 1 <= n <= slices
+        assert (n - 1) * per < chunks <= n * per
+    assert scratch["index_part_hist"] < scratch["index_part_ready"]
+    assert scratch["index_win_stage"] < scratch["index_cand_stage"]
+    assert scratch["index_cand_stage"] < scratch["index_gather_count"]
+    assert scratch["index_gather_count"] < scratch["_tile_stride"]
+    assert symmetric["flags"] >= count * symmetric["_tile_stride"]
