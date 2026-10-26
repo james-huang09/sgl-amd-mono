@@ -82,13 +82,80 @@ def poison_new_index_scales(pages: torch.Tensor, slots: torch.Tensor) -> None:
     scales[slots // PAGE_TOKENS, slots % PAGE_TOKENS] = POISON_SCALE
 
 
-def launch_scores(runtime, rows: int) -> torch.Tensor:
+def launch_scores(runtime, rows: int, step=None, layer: int = 0) -> torch.Tensor:
     """The launch's index scores as f32 bits, int32 [rows, index_max_seq]: the value
     words of the (value, tag) pairs in the runtime's scratch."""
+    from sgl_amd_mono.glm53.gfx950.layout import (
+        INDEX_LOCAL_CAPACITY,
+        index_cp_world,
+        index_score_capacity,
+        index_shard_tiles,
+    )
+
     n = runtime.key.index_max_seq
-    at = runtime.sc["index_scores"]
-    pairs = runtime.scratch[at : at + rows * n * 8].view(torch.int32)
-    return pairs.view(rows, n, 2)[..., 0]
+    tile = runtime.sc.get("_tile_rows", runtime.width)
+    cp = getattr(runtime.key, "indexer_cp", False)
+    slot = (
+        (int(runtime.epoch[0]) * runtime.key.launches_per_step + layer) & 1 if cp else 0
+    )
+    parts = []
+    for start in range(0, rows, tile):
+        count = min(tile, rows - start)
+        if cp:
+            stride = min(n, INDEX_LOCAL_CAPACITY)
+            at = runtime.sy["index_scores"] + slot * runtime.sy["_index_scores_stride"]
+            at += (start // tile) * runtime.sy["_tile_stride"]
+            raw = runtime.peer.bytes
+        else:
+            stride = n
+            at = runtime.sc["index_scores"] + (start // tile) * runtime.sc.get(
+                "_tile_stride", 0
+            )
+            raw = runtime.scratch
+        values = (
+            raw[at : at + count * stride * 8]
+            .view(torch.int32)
+            .view(count, stride, 2)[..., 0]
+        )
+        if cp and n > INDEX_LOCAL_CAPACITY:
+            if step is None:
+                raise ValueError(
+                    "CP score reconstruction needs the step's causal positions"
+                )
+            import torch.distributed as dist
+
+            ranks = index_cp_world(tile, runtime.key.tp, n)
+            shard_stride = index_score_capacity(n, ranks)
+            at = (
+                runtime.sc["index_scores"]
+                + (start // tile) * runtime.sc["_tile_stride"]
+            )
+            local = (
+                runtime.scratch[at : at + count * shard_stride * 8]
+                .view(torch.int32)
+                .view(count, shard_stride, 2)[..., 0]
+                .contiguous()
+                .cpu()
+            )
+            shards = [torch.empty_like(local) for _ in range(runtime.key.tp)]
+            dist.all_gather(shards, local, group=runtime.peer.group)
+            full = values.new_zeros(count, n)
+            full[:, :stride] = values
+            group_start = runtime.rank // ranks * ranks
+            for rank, shard in enumerate(shards[group_start : group_start + ranks]):
+                for row in range(count):
+                    bound = (
+                        int(step.positions[start + row]) + 1
+                        if int(step.slots[start + row]) >= 0
+                        else 0
+                    )
+                    if bound > INDEX_LOCAL_CAPACITY:
+                        begin, end = index_shard_tiles(bound, rank, ranks)
+                        begin, end = begin * 64, min(end * 64, bound)
+                        full[row, begin:end] = shard[row, : end - begin].to(full.device)
+            values = full
+        parts.append(values)
+    return torch.cat(parts)
 
 
 def _radix_keys(bits: torch.Tensor) -> torch.Tensor:

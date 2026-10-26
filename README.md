@@ -16,7 +16,7 @@ The library implements SGLang's monokernel interface ([RFC #43949](https://githu
 | --- | --- | --- | --- |
 | DeepSeek-V4.1-Flash | MI350X, MI355X (gfx950) | 2, 4 | All 40 layers in decode and DSpark verify steps of up to 48 rows, and the DSpark draft stages |
 | GLM-5.3-Flash | MI355X (gfx950) | 2, 4, 8 | All 45 layers (one launch each; layer 0 from the tokens, with the embedding) and the final norm, LM head and logits (one launch), in decode steps of up to 8 rows (4 at TP2) |
-| GLM-5.3 | MI355X (gfx950) | 4, 8 | All 75 MoE layers (one launch each), in decode and MTP verify steps of up to 8 rows (4 at TP4) |
+| GLM-5.3 | MI355X (gfx950) | 4, 8 | All 75 MoE layers (one launch each), up to 16 total query tokens at TP4 and 8 decode rows at TP8; [TP4 usage](docs/glm-tp4.md) |
 | MiniMax-M3 (MXFP4) | MI350X, MI355X (gfx950) | 4 | The 57 sparse MoE layers in decode and EAGLE3 verify steps of up to 16 rows |
 | MiniMax-M3.1-Flash (NVFP4 experts) | MI350X (gfx950) | 4 | The FFN of the 57 sparse layers, after SGLang's attention, in decode and DSpark verify steps of up to 16 rows |
 
@@ -108,6 +108,13 @@ SGLANG_USE_AITER=1 python -m sglang.launch_server \
 ```
 
 If the model, GPU or configuration is not supported, the server refuses to start and lists every reason.
+
+GLM-5.3 at TP4 supports A8W8 and Quark/AITER A4W4 experts with up to 16
+query tokens. Its optional `indexer_cp=True` forward argument partitions
+indexer score work across ranks and works with multi-CTA top-k selection.
+MLA cache supports BF16 and SGLang's raw E4M3 layout. See [TP4 usage and
+correctness checks](docs/glm-tp4.md) for weight formats, graph capture and
+multi-token requirements.
 
 ## Repository Structure
 
