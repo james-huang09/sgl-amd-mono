@@ -11,7 +11,15 @@ from pathlib import Path
 
 import torch
 import torch.distributed as dist
-from fixtures import HIDDEN, TOPK, check_untouched, fixture, make_weights, tensor_digest
+from fixtures import (
+    HIDDEN,
+    TOPK,
+    check_untouched,
+    fixture,
+    make_weights,
+    read_pairs,
+    tensor_digest,
+)
 from msgspec.structs import replace
 
 from sgl_amd_mono.glm53.gfx950.runner import (
@@ -21,18 +29,6 @@ from sgl_amd_mono.glm53.gfx950.runner import (
     Glm53Runtime,
     Glm53Step,
 )
-
-
-def read_pairs(rt, name, columns, dtype=torch.bfloat16):
-    rows = rt.sc.get("_tile_rows", rt.width)
-    result = []
-    for tile in range(rt.width // rows):
-        raw = rt.scratch
-        offset = rt.sc[name] + tile * rt.sc.get("_tile_stride", 0)
-        count = rows * columns // (2 if dtype == torch.bfloat16 else 1)
-        words = raw[offset : offset + count * 8].view(torch.int32).reshape(count, 2)
-        result.append(words[:, 0].contiguous().view(dtype).reshape(rows, columns))
-    return torch.cat(result)
 
 
 def main(args):
@@ -62,6 +58,14 @@ def main(args):
         args.seed + 1,
         request_width=args.query_tokens,
     )
+    if args.expanded_page_table:
+        # Preserve physical history/slots while assigning a different table row
+        # to every query, as SGLang's verify metadata does.
+        step = replace(
+            step,
+            page_table=step.page_table[step.req_ids.long()].contiguous(),
+            req_ids=torch.arange(total, dtype=torch.int32, device=device),
+        )
     caches = Glm53Caches(initial.kv.clone(), initial.idx.clone())
     external = (
         torch.load(f"{args.external_control}.rank{rank}.pt", weights_only=True)
@@ -252,6 +256,7 @@ def main(args):
             route_ties=args.route_ties,
             control_metrics=metrics,
             activation=args.activation,
+            expanded_page_table=args.expanded_page_table,
         )
         if args.check_causality:
             # Change only the final token of request 0. Earlier tokens and the
@@ -320,6 +325,11 @@ if __name__ == "__main__":
     parser.add_argument("--requests", type=int, default=2)
     parser.add_argument("--query-tokens", type=int, default=4)
     parser.add_argument("--capacity", type=int, default=4096)
+    parser.add_argument(
+        "--expanded-page-table",
+        action="store_true",
+        help="Assign a page-table row per query while keeping the same KV history",
+    )
     parser.add_argument("--seed", type=int, default=719)
     parser.add_argument(
         "--schedule",

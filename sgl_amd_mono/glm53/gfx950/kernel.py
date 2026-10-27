@@ -5262,11 +5262,6 @@ def build_glm5_monokernel(
             def patch_new_kv(query_row):
                 """Overlay this launch's visible rows without publishing persistent cache early."""
                 if const_expr(DEFER_OFF_CACHE):
-                    query_request = fx.Int32(
-                        bo.buffer_load(
-                            _rsrc(req_ids), query_row, vec_width=1, dtype=T.i32
-                        )
-                    )
                     query_position = row_position(query_row)
                     candidate_slots = []
                     candidate_live = []
@@ -5281,16 +5276,12 @@ def build_glm5_monokernel(
                                 _rsrc(full_positions), row * 2, vec_width=1, dtype=T.i32
                             )
                         )
-                        request = fx.Int32(
-                            bo.buffer_load(
-                                _rsrc(full_req_ids), row, vec_width=1, dtype=T.i32
-                            )
-                        )
                         candidate_slots.append(slot)
+                        # req_ids addresses page-table rows, which may be expanded
+                        # to one row per query. Physical slot equality below finds
+                        # the KV owner without confusing table rows with requests.
                         candidate_live.append(
-                            (slot >= 0)
-                            & (request == query_request)
-                            & (position <= query_position)
+                            (slot >= 0) & (position <= query_position)
                         )
                     for jj in range_constexpr(KPW):
                         j = wave * KPW + jj

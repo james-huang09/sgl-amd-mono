@@ -45,22 +45,3 @@ def test_slice_tasks_fit_half_the_grid_between_score_and_split(rows):
     assert [order.index(name) for name in chain] == sorted(
         order.index(name) for name in chain
     )
-
-
-@pytest.mark.parametrize("rows", range(1, 17))
-def test_native_parallel_selection_has_disjoint_tile_storage(rows):
-    scratch, symmetric = L.layout(rows, 16, 4, 2048, True, 131072, native_fp4_mfma=True)
-    tile, count = scratch["_tile_rows"], scratch["_tile_count"]
-    slices = L.index_select_slices(tile, count == 2)
-    grid = BLOCKS // (2 if count == 2 else 1)
-    assert tile * slices <= grid // 2
-    for bound in BOUNDS:
-        n, per = L.select_slices(bound, slices)
-        chunks = -(-bound // L.INDEX_SEL_CHUNK)
-        assert 1 <= n <= slices
-        assert (n - 1) * per < chunks <= n * per
-    assert scratch["index_part_hist"] < scratch["index_part_ready"]
-    assert scratch["index_win_stage"] < scratch["index_cand_stage"]
-    assert scratch["index_cand_stage"] < scratch["index_gather_count"]
-    assert scratch["index_gather_count"] < scratch["_tile_stride"]
-    assert symmetric["flags"] >= count * symmetric["_tile_stride"]

@@ -13,8 +13,14 @@ from pathlib import Path
 
 import torch
 import torch.distributed as dist
-from check_multitoken import read_pairs
-from fixtures import HIDDEN, check_untouched, fixture, make_weights, tensor_digest
+from fixtures import (
+    HIDDEN,
+    check_untouched,
+    fixture,
+    make_weights,
+    read_pairs,
+    tensor_digest,
+)
 from msgspec.structs import replace
 from mxfp4_reference import expert_factory, quantize, unpack
 

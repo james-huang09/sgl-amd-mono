@@ -16,6 +16,19 @@ from sgl_amd_mono.glm53.gfx950.runner import (
 HIDDEN, INDEX_DIM, TOPK = 6144, 128, 2048
 
 
+def read_pairs(rt, name, columns, dtype=torch.bfloat16):
+    rows = rt.sc.get("_tile_rows", rt.width)
+    result = []
+    for tile in range(rt.width // rows):
+        offset = rt.sc[name] + tile * rt.sc.get("_tile_stride", 0)
+        count = rows * columns // (2 if dtype == torch.bfloat16 else 1)
+        words = (
+            rt.scratch[offset : offset + count * 8].view(torch.int32).reshape(count, 2)
+        )
+        result.append(words[:, 0].contiguous().view(dtype).reshape(rows, columns))
+    return torch.cat(result)
+
+
 def make_weights(tp, device, ties=False, seed=719, expert_factory=None):
     g = torch.Generator(device=device).manual_seed(seed)
     heads, inter = 64 // tp, 2048 // tp

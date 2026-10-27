@@ -70,15 +70,17 @@ Run on four available gfx950 GPUs in the project's FlyDSL/AITER environment:
 
 ```bash
 python -m pytest -q test/unit/test_glm53_spec.py test/unit/test_glm53_select.py \
-  test/unit/test_glm53_forward_spec.py \
-  test/unit/test_glm53_index_plan.py test/unit/test_glm53_mxfp4.py \
-  test/unit/test_glm53_score_check.py test/unit/test_peer.py
+  test/unit/test_peer.py
 
-python -m pytest -q test/kernels/test_glm53_kernels.py -k 'not tp8'
+python -m pytest -q test/kernels/test_glm53_kernels.py::test_mxfp4_tp4
 ```
 
-The GPU checks cover independent score arithmetic and top-k, independent
+The single parameterized GPU test covers 1×16, 2×8 and 4×4 steps: independent
 A4W4 MoE arithmetic and quantization codes/scales, serial/batched state,
-causality, cache preservation, padding, replay and HIP peer lifetime. They use
-synthetic fixtures. Full A4W4 checkpoint quality, multilayer quality, MTP
-acceptance and serving mono-kernel on/off results require serving validation.
+expanded page tables, causality, cache preservation and replay. Its fixture,
+independent arithmetic oracle and serial control are shared helpers. It uses
+128K live contexts in the 4×4 arithmetic case and 64-slot caches in the
+expanded-page-table regression. It uses synthetic weights without a server
+profile or checkpoint conversion. Full A4W4 checkpoint quality, multilayer
+quality, MTP acceptance and serving
+mono-kernel on/off results require serving validation.

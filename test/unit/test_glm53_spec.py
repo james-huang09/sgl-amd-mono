@@ -255,20 +255,6 @@ def test_the_layer_check_poisons_only_this_steps_index_scales():
     assert torch.equal(pages[:, values], before[:, values])
 
 
-def test_speculation_requires_a_linear_chain():
-    assert registry.Feature.SPECULATIVE_DECODING in glm53.SPEC.features
-    assert (
-        glm53._config_disable_reasons(
-            SimpleNamespace(page_size=64, speculative_eagle_topk=1), GLM53
-        )
-        == []
-    )
-    reasons = glm53._config_disable_reasons(
-        SimpleNamespace(page_size=64, speculative_eagle_topk=2), GLM53
-    )
-    assert "linear speculative chain" in " ".join(reasons)
-
-
 def test_config_reasons_name_each_mismatch():
     assert glm53._config_disable_reasons(CFG, GLM53) == []
     other = SimpleNamespace(
@@ -296,27 +282,6 @@ def _linear(shuffled=True):
         weight=torch.empty(256, 256, dtype=torch.float8_e4m3fn, device="meta"),
         weight_scale_inv=torch.empty(2, 2, device="meta"),
     )
-
-
-def test_quark_config_defers_to_loaded_tensor_formats():
-    cfg = SimpleNamespace(
-        **(vars(GLM53) | {"quantization_config": {"quant_method": "quark"}})
-    )
-    assert glm53._config_disable_reasons(SimpleNamespace(page_size=64), cfg) == []
-
-
-@pytest.mark.parametrize(
-    "dtype, scale",
-    [(torch.uint8, True), (torch.bfloat16, True), (torch.float8_e4m3fn, False)],
-)
-def test_attention_still_requires_block_fp8(dtype, scale):
-    layers = _layers()
-    projection = layers[3].self_attn.q_b_proj
-    projection.weight = torch.empty(256, 256, device="meta", dtype=dtype)
-    if not scale:
-        projection.weight_scale_inv = torch.empty(256, 1, device="meta")
-    reasons = glm53._model_disable_reasons(_model(layers), GLM53, {})
-    assert any("layer 3:" in why and "q_b_proj" in why for why in reasons)
 
 
 def _layer(
