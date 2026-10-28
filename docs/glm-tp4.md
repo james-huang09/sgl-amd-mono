@@ -1,9 +1,9 @@
-# GLM-5.3 at TP4
+# GLM-5.3 at TP4 and TP8
 
 The GLM plugin runs the 75 MoE layers in one launch per layer, with up to 16
 query tokens per step at TP4. Dense layers, the final norm and logits use
 SGLang's existing forward. Larger steps use the model fallback. TP8 retains
-its existing eight-row range; the additional A4W4 path requires TP4.
+its eight-row range for both A8W8 and native A4W4.
 
 The grouped/cohort schedules are adapted from [ROCm/FlyDSL#1256](https://github.com/ROCm/FlyDSL/pull/1256)
 at `032072c9406475cde47cf2017506f7c2604d5cce`, using SGLang's request, weight and
@@ -14,13 +14,19 @@ paged-cache layouts.
 | Loaded experts | MoE activations | Requirements |
 | --- | --- | --- |
 | Block-FP8 | FP8 (A8W8) | AITER shuffled weights, FP32 block-128 scales |
-| Quark/AITER MXFP4 | FP4 (A4W4) | TP4, E2M1 weights and E8M0 scales, separated gate/up rows |
+| Quark/AITER MXFP4 | FP4 (A4W4) | TP4/TP8, E2M1 weights and E8M0 scales, separated gate/up rows |
 
 A4W4 reads `QuarkW4A4MXFp4MoE` storage in place: 256 routed experts and one
-fused shared expert, local intermediate width 512. Weight shapes are
-`[257, 1024, 3072]` and `[257, 6144, 256]`; shuffled scale shapes are
-`[257, 1024, 192]` and `[257, 6144, 16]`. Attention and indexer projections
-still require the existing shuffled block-FP8 format.
+fused shared expert. The local intermediate width follows tensor parallelism:
+
+| TP | Local intermediate | Gate/up bytes | Down bytes | Gate/up E8M0 scales | Down E8M0 scales |
+| --- | ---: | --- | --- | --- | --- |
+| 4 | 512 | `[257, 1024, 3072]` | `[257, 6144, 256]` | `[257, 1024, 192]` | `[257, 6144, 16]` |
+| 8 | 256 | `[257, 512, 3072]` | `[257, 6144, 128]` | `[257, 512, 192]` | `[257, 6144, 8]` |
+
+Attention and indexer projections still require the existing shuffled
+block-FP8 format. The layer op checks MXFP4 tensor element counts against the
+compiled TP shard before a launch.
 
 The loader rejects ambiguous packed bytes, W4A8, GU-interleaved/SiTU storage,
 missing scales and unshuffled weights. Loaded tensors determine the activation
@@ -35,9 +41,16 @@ The wide schedule requires a full 256-CU MI355X.
 
 ## Widths and multi-token steps
 
-A8W8 uses buckets 2, 4, 6, 8, 12 and 16. A4W4 uses exact widths 1–12 and
-pads 13–16 logical rows to the 16-row cohort bucket. The direct native builder
-also accepts every physical width 1–16.
+At TP4, A8W8 uses buckets 2, 4, 6, 8, 12 and 16. A4W4 uses exact widths
+1–12 and pads 13–16 logical rows to the 16-row cohort bucket. The direct native
+TP4 builder accepts every physical width 1–16.
+
+At TP8, both formats support up to eight total query rows. The serving spec
+pads logical widths to buckets 2, 4 and 8, including one-row decode at physical
+width two. Native A4W4 uses the generic schedule with eight local attention
+heads and intermediate width 256; TP4 grouped/cohort schedules stay restricted
+to TP4. MTP3 batch 1/2 × seq 4 uses the mono path. Batch 4 × seq 4 has sixteen
+rows and uses the normal serving fallback.
 
 Verify steps must contain one linear draft chain per request: EAGLE top-k 1
 and draft tokens equal to draft steps plus one. Each query sees keys only
@@ -66,21 +79,323 @@ retains ownership for collective retry; repeated successful closes are safe.
 
 ## Correctness checks
 
-Run on four available gfx950 GPUs in the project's FlyDSL/AITER environment:
+Run in the project's FlyDSL/AITER environment with four GPUs for TP4 or eight for TP8:
 
 ```bash
 python -m pytest -q test/unit/test_glm53_spec.py test/unit/test_glm53_select.py \
   test/unit/test_peer.py
 
 python -m pytest -q test/kernels/test_glm53_kernels.py::test_mxfp4_tp4
+python -m pytest -q test/kernels/test_glm53_kernels.py::test_mxfp4_tp8
 ```
 
-The single parameterized GPU test covers 1×16, 2×8 and 4×4 steps: independent
+The TP4 parameterized GPU test covers 1×16, 2×8 and MTP3-shaped 1×4, 2×4,
+4×4 steps. TP8 adds 1×4 and 2×4 with the same shared checks: independent
 A4W4 MoE arithmetic and quantization codes/scales, serial/batched state,
 expanded page tables, causality, cache preservation and replay. Its fixture,
 independent arithmetic oracle and serial control are shared helpers. It uses
-128K live contexts in the 4×4 arithmetic case and 64-slot caches in the
+128K live contexts in all seq-4 arithmetic cases and 64-slot caches in the
 expanded-page-table regression. It uses synthetic weights without a server
 profile or checkpoint conversion. Full A4W4 checkpoint quality, multilayer
 quality, MTP acceptance and serving
 mono-kernel on/off results require serving validation.
+
+## Optional performance measurements
+
+The same unit test can time its independently validated A4W4 layer cases:
+
+```bash
+GLM53_PERF=1 python -m pytest -s -v \
+  test/kernels/test_glm53_kernels.py::test_mxfp4_tp4
+```
+
+To also measure the current A8W8 path with the same shapes, capacities, seed
+and timing method:
+
+```bash
+GLM53_PERF=1 GLM53_PERF_A8W8=1 python -m pytest -s -v \
+  test/kernels/test_glm53_kernels.py::test_mxfp4_tp4
+```
+
+Select only the MTP3 matrix (batch 1/2/4, four verify rows per request):
+
+```bash
+GLM53_PERF=1 GLM53_PERF_A8W8=1 python -m pytest -s -v \
+  test/kernels/test_glm53_kernels.py::test_mxfp4_tp4 \
+  -k '1-4 or 2-4 or 4-4'
+```
+
+These shapes map to SGLang's EAGLE `num_steps=3`, `topk=1`,
+`num_draft_tokens=4`. The unit test does not start SGLang or measure draft
+generation/acceptance. All three MTP3 cases use 131072-slot caches with
+live lengths near 128K, so the batch sizes have comparable contexts.
+
+This optional comparison first checks A8W8's own causal serial/batched
+control and then times its full indexed batched layer. The A4W4 and A8W8
+helpers share timing/statistics in the existing `fixtures.py`. They use
+their respective synthetic expert weights; no cross-precision numerical
+equivalence or serving speedup is claimed.
+
+Timing is disabled by default. `GLM53_PERF_SAMPLES` defaults to 100 and
+`GLM53_PERF_WARMUP` to 20; at least 20 samples and one warmup are required.
+`GLM53_PERF_KERNEL_REPLAYS` defaults to 20 and requires at least 20 replays.
+The standalone `check_mxfp4.py` helper accepts `--perf`, `--perf-samples`,
+`--perf-warmup` and `--perf-kernel-replays` for the same measurements.
+
+Each `PERF_RESULT` JSON line reports median, P95, minimum, maximum and mean
+in microseconds, individual samples, per-rank statistics and source hashes.
+Each sample times one complete layer HIP graph replay including indexer,
+attention, MoE and TP communication, then takes the maximum duration
+across all ranks (four at TP4, eight at TP8). P95 is the nearest-rank percentile
+of those maxima, not the maximum of rank-local P95 values or a percentile of
+trial averages.
+
+Initial caches are restored before each replay outside the HIP event interval.
+Compilation, weight packing, cache copies and host barriers are excluded;
+one weight allocation is reused. The existing numerical, cache and replay
+checks must pass, and output/cache/guard checks are repeated after timing.
+These are synthetic single-layer GPU latency distributions; they do not
+measure serving TPOT or request P95. The 1×16 and 2×8 cases use 64-slot caches;
+the three seq-4 cases use 131072-slot caches. Perf mode does not time the separate fixed-index
+serial/batched page-table comparison.
+
+Perf mode separately profiles 20 graph replays to report every GPU kernel
+name, calls per replay, per-rank invocation median/P95 and total time per
+replay. `kernel_breakdown` contains those statistics and raw event durations.
+The recorder first primes ROCm graph tracing with one replay outside the
+`glm53_measured_kernel_replays` range. Only device events wholly inside that
+synchronized range are counted; all ranks must capture the complete 20
+measured mono launches. Capture validation is collective so a local failure
+does not leave peers gathering results while that rank enters runtime close.
+Each profiled replay is device-synchronized and followed by a host barrier
+before the next replay, matching the isolated-step scope of the ordinary
+replay samples. The annotation itself is excluded from kernel statistics.
+Each kernel's maximum rank mean total is reported for convenience; these
+independently selected maxima must not be summed into overall replay P95.
+Profiler timing is distinct from the uninstrumented replay distribution.
+Fused attention/indexer/MoE stages appear as one `glm5_monokernel` event;
+the epoch update appears as its own kernel. No internal stage duration is
+inferred from that fused event.
+
+## TP8 MTP3 unit checks
+
+The existing GPU script covers TP8 A4W4 and the original A8W8 verify widths:
+
+```bash
+GLM53_PERF=1 GLM53_PERF_A8W8=1 HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+  python -m pytest -s -v test/kernels/test_glm53_kernels.py::test_mxfp4_tp8
+
+# A8W8 alone
+GLM53_PERF=1 HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python -m pytest -s -v \
+  test/kernels/test_glm53_kernels.py::test_a8w8_tp8
+```
+
+This runs batch 1 and 2 with four query tokens each, the same 131072-slot
+caches, seed 821, serial controls and replay/kernel statistics as TP4.
+Local synthetic weight shapes change with TP; these are not partitions of
+one shared real checkpoint across TP4 and TP8.
+`GLM53_PERF=0` runs correctness only. Batch 4 × seq 4 is 16 rows and exceeds
+the TP8 serving mono limit of eight rows; serving uses the normal fallback
+for that shape. Native A4W4 supports TP8 within the same eight-row limit.
+
+TP8 matches the original E2E's tensor parallelism and MTP3 verify widths.
+These remain synthetic single-layer checks: the E2E uses a real GLM-5.3
+checkpoint, prompt-dependent contexts, multilayer serving and acceptance
+checks. Its 131072 chunked-prefill setting is not a fixed context length,
+and its script does not report comparable single-layer replay median/P95.
+
+During perf-harness validation, a TP4 A4W4 run passed arithmetic and 100
+isolated replay samples but hit a HIP illegal-address error while profiling
+back-to-back asynchronous replays. The final profiler uses isolated synchronized
+replays. That changes the profiling execution organization; it does not
+establish stability of the asynchronous reproducer or fix a production kernel.
+
+## Measured TP4 MTP3 results (2026-10-27)
+
+Node 51, MI355X GPUs 0–3, current branch based on `ef803ac`. All three parameterized tests passed (636.70 s). Synthetic single-layer full-indexer replay at TP4, seed 821, capacity 131072; actual live lengths 131066–131071. Twenty warmups, 100 uninstrumented replay samples, maximum rank duration per sample, nearest-rank P95. These are one-step, one-layer measurements. A8W8 is the current branch path, not an upstream checkout or TP8 E2E baseline.
+
+| Batch × seq | A4W4 median (µs) | A4W4 P95 (µs) | A8W8 median (µs) | A8W8 P95 (µs) |
+| --- | ---: | ---: | ---: | ---: |
+| 1 × 4 | 248.18 | 284.80 | 262.48 | 307.44 |
+| 2 × 4 | 360.58 | 422.81 | 412.81 | 459.77 |
+| 4 × 4 | 481.17 | 542.61 | 631.07 | 717.13 |
+
+The separate profiler pass captures two GPU kernels, each called once per replay on every rank: `glm5_monokernel_0` and the epoch increment (`vectorized_elementwise_kernel` with `CUDAFunctorOnSelf_add<int>`). The mono event includes fused indexer, attention, MoE and TP communication; internal stage durations are unavailable from this event. Profiler invocation P95 and replay P95 have different timing windows and must not be summed.
+
+| Precision | Batch × seq | GPU kernel | Max rank mean total/replay (µs) | Largest rank invocation P95 (µs) |
+| --- | --- | --- | ---: | ---: |
+| A4W4 | 1 × 4 | mono | 189.14 | 183.08 |
+| A4W4 | 1 × 4 | epoch increment | 3.42 | 3.48 |
+| A8W8 | 1 × 4 | mono | 230.23 | 218.12 |
+| A8W8 | 1 × 4 | epoch increment | 3.60 | 5.16 |
+| A4W4 | 2 × 4 | mono | 315.37 | 310.60 |
+| A4W4 | 2 × 4 | epoch increment | 3.40 | 3.60 |
+| A8W8 | 2 × 4 | mono | 363.46 | 357.88 |
+| A8W8 | 2 × 4 | epoch increment | 3.62 | 5.20 |
+| A4W4 | 4 × 4 | mono | 428.09 | 436.76 |
+| A4W4 | 4 × 4 | epoch increment | 3.38 | 3.52 |
+| A8W8 | 4 × 4 | mono | 569.21 | 566.93 |
+| A8W8 | 4 × 4 | epoch increment | 3.41 | 3.48 |
+
+## Final synchronized-profiler TP4 regression
+
+The final shared helper passed the complete batch 1 × seq 4 parameterized test (A4W4 and A8W8), 1 passed in 80.98 s. Ordinary timing is unchanged; the profile pass primes tracing once outside its measured range, filters the range annotation, and synchronizes each measured replay. Each real GPU kernel has 20 events per rank and one call/replay.
+
+| Precision | Replay median (µs) | Replay P95 (µs) | Kernel | Max rank mean total/replay (µs) | Largest rank invocation P95 (µs) |
+| --- | ---: | ---: | --- | ---: | ---: |
+| fp4 | 244.90 | 284.52 | mono | 206.51 | 299.20 |
+| fp4 | 244.90 | 284.52 | epoch increment | 3.49 | 3.60 |
+| fp8 | 255.14 | 288.00 | mono | 223.54 | 244.04 |
+| fp8 | 255.14 | 288.00 | epoch increment | 3.67 | 3.52 |
+
+The earlier TP4 three-case matrix above used a back-to-back profiler pass; these final regression kernel distributions use isolated synchronized profile replays. Do not pool their kernel samples. Both ordinary replay distributions measure isolated full-layer steps.
+
+A prior A4W4 TP4 smoke run completed arithmetic and 100 isolated replay samples but failed with HIP illegal-address during the asynchronous back-to-back profiler loop. Final isolated profiling passes; the asynchronous reproducer remains unresolved. This is a profiling-organization change, not a production kernel fix.
+
+Small verified summary: `perf_mtp3_tp4_final_smoke_v2_node51.summary.json`. All seven source hashes match the final remote source snapshot. No production kernel changed.
+
+## Final TP8 A8W8 results (2026-10-27)
+
+Node 51, MI355X GPUs 0–7. Both MTP3 parameterized cases passed: 2 passed in 93.78 s. TP8, synthetic weights, seed 821, 131072-slot caches, one full indexed layer graph replay per sample. Ordinary replay uses 20 warmups and 100 samples; each sample is the maximum rank HIP-event duration and P95 uses nearest rank. All seven source hashes match the local final scripts and production kernel.
+
+| Batch × seq | Replay median (µs) | Replay P95 (µs) |
+| --- | ---: | ---: |
+| 1 × 4 | 246.40 | 304.80 |
+| 2 × 4 | 372.92 | 442.80 |
+| 4 × 4 | unsupported TP8 mono width | normal serving fallback; not measured |
+
+Twenty isolated profile replays plus one unmeasured tracer priming replay. Both actual GPU kernels have 20 invocation samples on every rank and one call/replay. The profiler annotation is excluded. Kernel P95 is a separate invocation distribution, not whole-replay P95.
+
+| Batch × seq | Kernel | Max rank mean total/replay (µs) | Largest rank invocation P95 (µs) |
+| --- | --- | ---: | ---: |
+| 1 × 4 | mono | 205.61 | 254.28 |
+| 1 × 4 | epoch increment | 3.69 | 4.88 |
+| 2 × 4 | mono | 332.92 | 388.20 |
+| 2 × 4 | epoch increment | 3.63 | 3.64 |
+
+Original TP8 E2E TP size and MTP3 verify widths are matched; real-checkpoint serving accuracy, TPOT, acceptance and prompt distribution are not tested by this synthetic unit run. That earlier snapshot measured A8W8 only; the TP8 A4W4 extension is recorded below. TP8/TP4 synthetic local weight shapes differ, so these timings do not establish same-checkpoint scaling.
+
+Verified small summary with all rank samples, actual kernel names, correctness metrics, environment, command and source hashes: `perf_mtp3_tp8_final_ef803ac_node51.summary.json`. Final source path on node 51: `candidate_tp8`. Earlier profiler failures and diagnostic source snapshots remain recorded remotely; their timing samples are not pooled into the final table.
+
+## TP8 native A4W4 extension (2026-10-27)
+
+Node 51, MI355X GPUs 0–7, branch `glm5.3-mono-kernel-a4w4` based on
+`ef803ac` with the TP8 extension described here. The complete paired MTP3 unit matrix
+passed: 2 passed in 638.07 s. Both formats use seed 821, 131072-slot caches,
+20 warmups and 100 isolated full-layer graph replays. Each sample is the
+maximum HIP-event duration across eight ranks; P95 uses nearest rank.
+
+| Batch × seq | A4W4 median (µs) | A4W4 P95 (µs) | A8W8 median (µs) | A8W8 P95 (µs) |
+| --- | ---: | ---: | ---: | ---: |
+| 1 × 4 | 233.14 | 281.44 | 252.78 | 326.80 |
+| 2 × 4 | 336.32 | 421.73 | 372.72 | 408.81 |
+| 4 × 4 | unsupported TP8 width | serving fallback | unsupported TP8 width | serving fallback |
+
+A4W4 median is lower in both measured cases. Batch 2 A4W4 P95 is about 3.2%
+higher than A8W8 in this run. These distributions do not establish a general
+latency improvement or serving speedup.
+
+The separate isolated profiler captures every actual GPU kernel: one fused
+mono launch and one epoch increment per replay. All eight ranks have exactly
+20 samples for each kernel. Internal indexer/attention/MoE/TP stage durations
+are contained in the fused mono event and cannot be separated from these events.
+
+| Precision | Batch × seq | Kernel | Max rank mean total/replay (µs) | Largest rank invocation P95 (µs) |
+| --- | --- | --- | ---: | ---: |
+| A4W4 | 1 × 4 | `glm5_monokernel_0` | 197.72 | 240.64 |
+| A4W4 | 1 × 4 | epoch increment | 3.57 | 3.68 |
+| A8W8 | 1 × 4 | `glm5_monokernel_0` | 214.52 | 278.04 |
+| A8W8 | 1 × 4 | epoch increment | 3.67 | 3.88 |
+| A4W4 | 2 × 4 | `glm5_monokernel_0` | 284.16 | 334.72 |
+| A4W4 | 2 × 4 | epoch increment | 3.64 | 3.80 |
+| A8W8 | 2 × 4 | `glm5_monokernel_0` | 325.85 | 394.32 |
+| A8W8 | 2 × 4 | epoch increment | 3.54 | 3.64 |
+
+Epoch increment's actual GPU name is
+`void at::native::vectorized_elementwise_kernel<4, at::native::CUDAFunctorOnSelf_add<int>, std::array<char*, 2ul> >(int, at::native::CUDAFunctorOnSelf_add<int>, std::array<char*, 2ul>)`.
+Kernel invocation P95 is distinct from full replay P95; kernel maxima must not
+be added to obtain total replay P95.
+
+Independent A4W4 MoE checks preserve the original relative-L2 limit of 1e-3.
+For batch 1/2 respectively, max up/gate relative L2 is 5.14e-8/5.28e-8 and
+max composed MoE relative L2 is 0/4.97e-5. Input FP4 codes and E8M0 scales are
+exact. Cache preservation, eager/graph replay, expanded-page-table addressing,
+serial/batched controls and causality checks passed. A8W8 passes its own
+serial/batched control; it uses separate synthetic expert weights.
+
+Four additional TP8 probes use the existing `check_mxfp4.py` helper and all
+passed. Launch each with `python -m torch.distributed.run --standalone
+--nproc-per-node=8 test/kernels/glm53/check_mxfp4.py --capacity 64`, followed by:
+
+```text
+--rows 2 --request-width 1 --pad-rows 1 --external --kv-fp8 --quant-edges --ties --seed 822
+--rows 4 --request-width 1 --pad-rows 1 --kv-fp8 --seed 823
+--rows 8 --request-width 4 --route-pattern disjoint --check-causality --seed 824
+--rows 8 --request-width 4 --route-pattern overlap --external --check-causality --seed 825
+```
+
+These cover the minimum padded decode width, inactive rows, E4M3 cache
+encoding, E2M1/E8M0 quantization boundaries, identical/disjoint/overlapping
+routes, the non-indexer path and causal request isolation. Original numerical,
+cache and graph replay checks remain active in every probe. No new test files
+or E2E cases were added.
+
+All replay and GPU-kernel median/P95 statistics were independently recomputed
+from raw samples. Ten source hashes identify the production and unit code;
+large validation tensors remain remote. The small metrics summary is
+`tp8_a4_mtp3_perf.summary.json`, under the node 51 task root
+`/shared/amdgpu/home/jiahao_zhou_qle/hzm/sgl_glm_mtp3_unit_20261027`.
+These are synthetic single-layer unit results; real-checkpoint quality, MTP
+acceptance and serving TPOT are untested by this run.
+
+CPU spec/select/peer checks passed: 171 passed in 6.59 s. TP4 regression for
+1×4 and 4×4 passed: 2 passed in 207.02 s, covering the generic and 16-row
+cohort schedules after the TP8 extension. All required validations passed.
+Static isort/Ruff/compileall and final diff checks passed. These measurements
+identify the tested source snapshot based on `ef803ac`; the source hashes are
+recorded in the summary.
+
+## A8W8 comparison with latest main (2026-10-28)
+
+One case on node 47 GPUs 0–3: TP4, batch 1 × seq 4, 128K context, A8W8,
+BF16 KV, seed 821. Latest main is `4db53865b7131b16990ef532b8ee6e0ec59f69da`
+([#66](https://github.com/sgl-project/sgl-amd-mono/pull/66)); the candidate is the
+TP8-extension snapshot based on `ef803ac`. Both use identical synthetic
+weights, inputs, caches, replay organization and statistics. Order is
+main → candidate → candidate → main, with 20 warmups and 100 isolated
+replays per pass. This table combines the 200 individual maximum-rank replay
+samples per version; P95 uses nearest rank.
+
+| Version | Full-layer replay median (µs) | Full-layer replay P95 (µs) |
+| --- | ---: | ---: |
+| Latest main `4db5386` | 255.30 | 294.44 |
+| TP8-extension snapshot | 264.34 | 298.36 |
+
+Candidate median is 3.54% higher and P95 is 1.33% higher in this case. The
+cause of this small difference has not been isolated. This comparison
+includes upstream guarded-wait and eager-dispatch updates (#19/#64/#66)
+that are absent from the candidate; it does not isolate the A4W4 extension.
+Graph replay does not invoke the eager dispatcher changed by #66.
+TP8 and serving latency were not measured in this comparison.
+
+Both versions pass causal serial/batched controls, routing, cache preservation
+and eager/graph replay. Inputs, outputs, ordered indices, intermediate tensors
+and cache hashes are bitwise identical across all four ranks. The comparison
+harness pads a one-row serial group to two physical rows, matching serving
+`_width(1)`, for both versions. The timed batched launch has four physical
+rows. The original numerical limit remains relative L2 ≤ 1e-3.
+
+Each separate profiler pass captures 20 mono and 20 epoch-increment events
+per rank. Combining both passes gives these kernel statistics:
+
+| Version | Kernel | Max rank mean total/replay (µs) | Largest rank invocation P95 (µs) |
+| --- | --- | ---: | ---: |
+| Latest main | mono | 226.71 | 285.44 |
+| Latest main | epoch increment | 3.59 | 5.84 |
+| TP8-extension snapshot | mono | 228.13 | 255.80 |
+| TP8-extension snapshot | epoch increment | 3.55 | 3.52 |
+
+Kernel invocation P95 is distinct from whole-replay P95. Fused internal stage
+times are not inferred. Raw metrics, commands, source hashes and exact
+numerical checks are in `a8_latest_one_case.summary.json` under the node 47
+run root `/shared/amdgpu/home/jun_chen2_qle/hzm_work/sgl_a8_upstream_20261028`.

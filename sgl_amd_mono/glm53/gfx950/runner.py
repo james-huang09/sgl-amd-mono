@@ -62,8 +62,10 @@ class Glm53Build(msgspec.Struct, frozen=True):
             raise ValueError(
                 "MXFP4 experts require FP4 activations; A8W4 is unsupported"
             )
-        if self.expert_mxfp4 and self.tp != 4:
-            raise ValueError("SGL native MXFP4 is supported at TP4")
+        if self.expert_mxfp4 and self.tp not in (4, 8):
+            raise ValueError("SGL native MXFP4 is supported at TP4 and TP8")
+        if self.expert_mxfp4 and self.tp == 8 and self.rows > 8:
+            raise ValueError("TP8 native MXFP4 supports up to 8 rows")
 
     @property
     def heads(self) -> int:

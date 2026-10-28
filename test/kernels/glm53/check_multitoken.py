@@ -14,11 +14,14 @@ import torch.distributed as dist
 from fixtures import (
     HIDDEN,
     TOPK,
+    add_perf_args,
     check_untouched,
     fixture,
     make_weights,
+    measure_replay,
     read_pairs,
     tensor_digest,
+    validate_perf_args,
 )
 from msgspec.structs import replace
 
@@ -33,7 +36,10 @@ from sgl_amd_mono.glm53.gfx950.runner import (
 
 def main(args):
     rank, tp = dist.get_rank(), dist.get_world_size()
-    assert tp == 4
+    assert tp in (4, 8), "requires TP4 or TP8"
+    assert tp != 8 or args.requests * args.query_tokens <= 8, (
+        "TP8 supports up to 8 rows"
+    )
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
     total = args.requests * args.query_tokens
@@ -74,12 +80,13 @@ def main(args):
     )
     if external is not None:
         weights = replace(weights, index=None)
-    state_columns = [("q_lat", 16 * 512), ("a", HIDDEN), ("o", 16 * 256)]
+    heads, inter = 64 // tp, 2048 // tp
+    state_columns = [("q_lat", heads * 512), ("a", HIDDEN), ("o", heads * 256)]
     if external is None:
         state_columns.insert(0, ("index_q", 4096))
     dtypes = {}
     if args.check_routing:
-        state_columns += [("sel", 9), ("prob", 9), ("mid", 9 * 512)]
+        state_columns += [("sel", 9), ("prob", 9), ("mid", 9 * inter)]
         dtypes = {"sel": torch.int32, "prob": torch.float32, "mid": torch.float32}
     compared_names = ["output", *(name for name, _ in state_columns if name != "sel")]
     if args.schedule == "serial":
@@ -288,6 +295,24 @@ def main(args):
                     else torch.equal(restored[name], observed[name])
                 ), f"restored inputs changed {name}"
             result["future_token_and_request_isolation"] = "passed"
+        perf = None
+        if args.perf:
+
+            def restore():
+                caches.kv.copy_(initial.kv)
+                caches.idx.copy_(initial.idx)
+                torch.cuda.synchronize()
+
+            def verify():
+                replayed = snapshot()
+                for name, expected in observed.items():
+                    assert (
+                        replayed[name] == expected
+                        if name == "cache_sha256"
+                        else torch.equal(replayed[name], expected)
+                    ), f"perf replay changed {name}"
+
+            perf = measure_replay(args, graph, restore, verify, len(runtimes))
         if args.profile_launches:
             dist.barrier()
             with torch.profiler.profile(
@@ -314,6 +339,22 @@ def main(args):
         result["control_metrics_all_ranks"] = all_metrics
         if rank == 0:
             print("RESULT " + json.dumps(result), flush=True)
+            if perf is not None:
+                perf.update(
+                    requests=args.requests,
+                    query_tokens=args.query_tokens,
+                    total_rows=total,
+                    capacity=args.capacity,
+                    live_lengths=lengths,
+                    seed=args.seed,
+                    tp=tp,
+                    activation=args.activation,
+                    with_indexer=external is None,
+                    kv_dtype=str(caches.kv.dtype),
+                    rows_per_launch=[len(group) for group in groups],
+                    schedule=args.schedule,
+                )
+                print("PERF_RESULT " + json.dumps(perf), flush=True)
     finally:
         for rt in reversed(runtimes):
             rt.close()
@@ -358,7 +399,9 @@ if __name__ == "__main__":
         action="store_true",
         help="Force identical tied router scores for all query tokens",
     )
+    add_perf_args(parser)
     args = parser.parse_args()
+    validate_perf_args(parser, args)
     dist.init_process_group("gloo")
     try:
         main(args)

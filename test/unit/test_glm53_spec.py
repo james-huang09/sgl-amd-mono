@@ -369,3 +369,49 @@ def test_every_indexer_rotary_must_equal_the_mla_one():
     assert torch.equal(cos, table[:, :32].to(torch.bfloat16))
     with pytest.raises(ValueError, match="indexer's rotary"):
         rope_tables([layer(), layer(table + 1)], {})
+
+
+@pytest.mark.parametrize("inter", [256, 512])
+def test_mxfp4_expert_shards_accept_tp8_and_tp4_layouts(inter):
+    from sgl_amd_mono.glm53.gfx950.weights import _mxfp4_reason
+
+    def tensor(*shape):
+        value = torch.empty(*shape, dtype=torch.uint8, device="meta")
+        value.is_shuffled = True
+        return value
+
+    experts = SimpleNamespace(
+        scheme=type("QuarkW4A4MXFp4MoE", (), {})(),
+        moe_runner_config=SimpleNamespace(activation="silu"),
+        w13_weight=tensor(257, 2 * inter, 3072),
+        w2_weight=tensor(257, 6144, inter // 2),
+        w13_weight_scale=tensor(257, 2 * inter, 192),
+        w2_weight_scale=tensor(257, 6144, inter // 32),
+    )
+    assert _mxfp4_reason(experts) is None
+    experts.w2_weight_scale = tensor(257, 6144, inter // 32 + 1)
+    assert "w2_weight_scale" in _mxfp4_reason(experts)
+    experts.w2_weight_scale = tensor(257, 6144, inter // 32)
+    experts.w13_weight.is_shuffled = False
+    assert "shuffled" in _mxfp4_reason(experts)
+
+
+def test_mxfp4_tp8_build_rejects_unsupported_parallelism_and_widths():
+    from sgl_amd_mono.glm53.gfx950.runner import Glm53Build
+
+    args = dict(
+        rows=8,
+        tp=8,
+        launches_per_step=1,
+        with_indexer=True,
+        index_max_seq=131072,
+        fp8_shuffled=True,
+        expert_mxfp4=True,
+        moe_activation_dtype="fp4",
+    )
+    build = Glm53Build(**args)
+    assert build.heads == 8 and build.inter == 256
+    with pytest.raises(ValueError, match="up to 8 rows"):
+        Glm53Build(**{**args, "rows": 9})
+    with pytest.raises(ValueError, match="TP4 and TP8"):
+        Glm53Build(**{**args, "tp": 2})

@@ -1,6 +1,6 @@
-"""TP4 native A4W4 layer: independent MoE golden, caches and replay.
+"""TP4/TP8 native A4W4 layer: independent MoE golden, caches and replay.
 
-Run with torchrun --standalone --nproc-per-node=4. Control weights and tensors
+Run with torchrun --standalone --nproc-per-node=4 or 8. Control weights and tensors
 stay on the GPU server. The golden checks the changed MoE subgraph using the
 layer's post-attention boundary; attention/indexer retain their existing tests.
 """
@@ -15,11 +15,14 @@ import torch
 import torch.distributed as dist
 from fixtures import (
     HIDDEN,
+    add_perf_args,
     check_untouched,
     fixture,
     make_weights,
+    measure_replay,
     read_pairs,
     tensor_digest,
+    validate_perf_args,
 )
 from msgspec.structs import replace
 from mxfp4_reference import expert_factory, quantize, unpack
@@ -46,14 +49,17 @@ def error(actual, expected):
 
 def check(args):
     rank = dist.get_rank()
-    assert dist.get_world_size() == 4, "native A4W4 requires TP4"
+    tp = dist.get_world_size()
+    assert tp in (4, 8), "native A4W4 requires TP4 or TP8"
+    assert tp != 8 or args.rows <= 8, "TP8 supports up to 8 rows"
+    inter = 2048 // tp
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     torch.backends.cuda.matmul.allow_tf32 = False
     device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
     originals = {}
     weights = replace(
         make_weights(
-            4, device, seed=args.seed, expert_factory=expert_factory(originals, rank)
+            tp, device, seed=args.seed, expert_factory=expert_factory(originals, rank)
         ),
         expert_mxfp4=True,
     )
@@ -127,7 +133,7 @@ def check(args):
     rt = Glm53Runtime(
         Glm53Build(
             args.rows,
-            4,
+            tp,
             1,
             not args.external,
             args.capacity if not args.external else 0,
@@ -161,7 +167,9 @@ def check(args):
         if expected_routes is not None:
             assert selected.tolist() == expected_routes, "prescribed routes"
         probability = read_pairs(rt, "prob", 9, torch.float32)
-        mid = read_pairs(rt, "mid", 9 * 512, torch.float32).reshape(args.rows, 9, 512)
+        mid = read_pairs(rt, "mid", 9 * inter, torch.float32).reshape(
+            args.rows, 9, inter
+        )
         # Independently normalize the attention boundary and quantize it.
         normalized = (
             a.float()
@@ -203,7 +211,7 @@ def check(args):
             down_composed[row] = total_composed
 
         def output_reference(local):
-            parts = [torch.empty_like(local, dtype=torch.bfloat16) for _ in range(4)]
+            parts = [torch.empty_like(local, dtype=torch.bfloat16) for _ in range(tp)]
             dist.all_gather(parts, local.bfloat16())
             total = torch.zeros_like(local)
             for part in parts:
@@ -326,6 +334,25 @@ def check(args):
             run()
             torch.cuda.synchronize()
             assert torch.equal(first, rt.outs[0]), "causal test restoration"
+        perf = None
+        if args.perf:
+
+            def restore():
+                caches.kv.copy_(initial.kv)
+                caches.idx.copy_(initial.idx)
+                torch.cuda.synchronize()
+
+            def verify():
+                assert torch.equal(first, rt.outs[0]), "perf output replay"
+                assert torch.equal(initial_indices, step.topk), "perf ordered indices"
+                assert cache_hash == (
+                    tensor_digest(caches.kv),
+                    tensor_digest(caches.idx),
+                ), "perf caches"
+                check_untouched(initial, caches, step.slots)
+                assert not rt.epoch[3:6].any(), "perf guard error"
+
+            perf = measure_replay(args, graph, restore, verify)
         launch_counts = None
         if args.profile_launches:
             dist.barrier()
@@ -376,10 +403,25 @@ def check(args):
             graph_replay="passed",
             caches="passed",
         )
-        all_results = [None] * 4
+        all_results = [None] * tp
         dist.all_gather_object(all_results, result)
         if rank == 0:
             print("RESULT " + json.dumps(all_results), flush=True)
+        if rank == 0 and perf is not None:
+            perf.update(
+                requests=args.rows // request_width,
+                query_tokens=request_width,
+                total_rows=args.rows,
+                capacity=args.capacity,
+                live_lengths=lengths,
+                seed=args.seed,
+                tp=tp,
+                activation="fp4",
+                with_indexer=not args.external,
+                kv_dtype=str(caches.kv.dtype),
+                rows_per_launch=[args.rows],
+            )
+            print("PERF_RESULT " + json.dumps(perf), flush=True)
     finally:
         rt.close()
 
@@ -402,8 +444,11 @@ if __name__ == "__main__":
     parser.add_argument("--save-control")
     parser.add_argument("--check-control")
     parser.add_argument("--profile-launches", action="store_true")
+    add_perf_args(parser)
+    args = parser.parse_args()
+    validate_perf_args(parser, args)
     dist.init_process_group("gloo")
     try:
-        check(parser.parse_args())
+        check(args)
     finally:
         dist.destroy_process_group()

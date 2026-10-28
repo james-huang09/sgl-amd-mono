@@ -239,8 +239,10 @@ def build_glm5_monokernel(
         raise ValueError("A4W4 requires native MFMA and ATOM MXFP4 expert weights")
     if expert_mxfp4 and moe_activation_dtype != "fp4":
         raise ValueError("MXFP4 experts require FP4 activations; A8W4 is unsupported")
-    if native_fp4_mfma and npes != 4:
-        raise ValueError("SGL native MXFP4 is supported at TP4")
+    if native_fp4_mfma and npes not in (4, 8):
+        raise ValueError("SGL native MXFP4 is supported at TP4 and TP8")
+    if native_fp4_mfma and npes == 8 and S > 8:
+        raise ValueError("TP8 native MXFP4 supports up to 8 rows")
     activation_fp4 = moe_activation_dtype == "fp4"
     keyed = key_tuple(locals(), SOURCES)
     total_samples = S

@@ -2,8 +2,13 @@
 
 import hashlib
 import math
+import statistics
+import time
+from collections import defaultdict
+from pathlib import Path
 
 import torch
+import torch.distributed as dist
 
 from sgl_amd_mono.glm53.gfx950.packing import pack_bf16, pack_fp8, pack_ptpc_fp8
 from sgl_amd_mono.glm53.gfx950.runner import (
@@ -27,6 +32,179 @@ def read_pairs(rt, name, columns, dtype=torch.bfloat16):
         )
         result.append(words[:, 0].contiguous().view(dtype).reshape(rows, columns))
     return torch.cat(result)
+
+
+def latency_stats(samples):
+    """Nearest-rank P95 of individual replay or kernel invocation samples."""
+    ordered = sorted(samples)
+    return dict(
+        samples=len(ordered),
+        median_us=statistics.median(ordered),
+        p95_us=ordered[math.ceil(0.95 * len(ordered)) - 1],
+        min_us=ordered[0],
+        max_us=ordered[-1],
+        mean_us=statistics.mean(ordered),
+    )
+
+
+def add_perf_args(parser):
+    parser.add_argument("--perf", action="store_true")
+    parser.add_argument("--perf-samples", type=int, default=100)
+    parser.add_argument("--perf-warmup", type=int, default=20)
+    parser.add_argument("--perf-kernel-replays", type=int, default=20)
+
+
+def validate_perf_args(parser, args):
+    if args.perf and (
+        args.perf_samples < 20 or args.perf_warmup < 1 or args.perf_kernel_replays < 20
+    ):
+        parser.error(
+            "--perf requires at least 20 samples/kernel replays and one warmup"
+        )
+    if args.perf and args.profile_launches:
+        parser.error("--perf already profiles kernels; omit --profile-launches")
+
+
+def measure_replay(args, graph, restore, verify, mono_calls_per_replay=1):
+    """Shared A4/A8 full replay timing and separate GPU-kernel profiling."""
+    rank, tp = dist.get_rank(), dist.get_world_size()
+    if rank == 0:
+        print("PERF_PROGRESS warmup", flush=True)
+    for _ in range(args.perf_warmup):
+        restore()
+        dist.barrier()
+        graph.replay()
+        torch.cuda.synchronize()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    samples = []
+    timing_started = time.time()
+    for _ in range(args.perf_samples):
+        restore()
+        dist.barrier()
+        start.record()
+        graph.replay()
+        end.record()
+        end.synchronize()
+        elapsed_us = start.elapsed_time(end) * 1000
+        assert math.isfinite(elapsed_us) and elapsed_us > 0
+        samples.append(elapsed_us)
+    timing_ended = time.time()
+    verify()
+    if rank == 0:
+        print("PERF_PROGRESS replay timing complete; kernel profile", flush=True)
+    restore()
+    dist.barrier()
+    profile_started = time.time()
+    with torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ]
+    ) as profile:
+        # Prime ROCm graph tracing inside the recorder, outside the measured
+        # range. The first replay can be absent from the device event stream.
+        graph.replay()
+        torch.cuda.synchronize()
+        dist.barrier()
+        # Keep every rank's recorder active for the entire TP replay sequence.
+        # Recorder setup/teardown skew can otherwise drop a boundary launch.
+        with torch.profiler.record_function("glm53_measured_kernel_replays"):
+            dist.barrier()
+            for _ in range(args.perf_kernel_replays):
+                graph.replay()
+                torch.cuda.synchronize()
+                dist.barrier()
+    profile_ended = time.time()
+    verify()
+    windows = [
+        event.time_range
+        for event in profile.events()
+        if event.name == "glm53_measured_kernel_replays"
+        and event.device_type == torch.autograd.DeviceType.CPU
+    ]
+    assert len(windows) == 1, "profiler lost the measured replay range"
+    window = windows[0]
+    kernels = defaultdict(list)
+    for event in sorted(profile.events(), key=lambda e: e.time_range.start):
+        if (
+            event.device_type == torch.autograd.DeviceType.CUDA
+            and event.name != "glm53_measured_kernel_replays"
+            and window.start <= event.time_range.start
+            and event.time_range.end <= window.end
+        ):
+            kernels[event.name].append(event.time_range.elapsed_us())
+    samples_all_ranks, kernels_all_ranks = [None] * tp, [None] * tp
+    dist.all_gather_object(samples_all_ranks, samples)
+    dist.all_gather_object(kernels_all_ranks, dict(kernels))
+    # Validate collectively so a local capture failure cannot strand peers
+    # gathering results while the failed rank enters collective runtime close.
+    for owner, owned in enumerate(kernels_all_ranks):
+        counts = {name: len(values) for name, values in owned.items()}
+        assert owned, f"rank {owner}: profiler captured no GPU events"
+        assert sum(n for name, n in counts.items() if "glm5_monokernel" in name) == (
+            args.perf_kernel_replays * mono_calls_per_replay
+        ), f"rank {owner}: unexpected profiler monokernel calls: {counts}"
+    if rank != 0:
+        return None
+    print("PERF_PROGRESS kernel profile complete", flush=True)
+    slowest = [max(values) for values in zip(*samples_all_ranks)]
+    breakdown = []
+    for name in sorted(set().union(*(k.keys() for k in kernels_all_ranks))):
+        per_rank = []
+        for owner, owned in enumerate(kernels_all_ranks):
+            values = owned.get(name, [])
+            if values:
+                per_rank.append(
+                    dict(
+                        rank=owner,
+                        calls_per_replay=len(values) / args.perf_kernel_replays,
+                        mean_total_us_per_replay=sum(values) / args.perf_kernel_replays,
+                        **latency_stats(values),
+                    )
+                )
+        breakdown.append(
+            dict(
+                name=name,
+                max_rank_mean_total_us_per_replay=max(
+                    r["mean_total_us_per_replay"] for r in per_rank
+                ),
+                per_rank=per_rank,
+                samples_all_ranks_us=[k.get(name, []) for k in kernels_all_ranks],
+            )
+        )
+    source_root = Path(__file__).resolve().parents[3]
+    sources = [
+        "sgl_amd_mono/glm53/gfx950/kernel.py",
+        "sgl_amd_mono/glm53/gfx950/runner.py",
+        "sgl_amd_mono/glm53/gfx950/layout.py",
+        "test/kernels/glm53/fixtures.py",
+        "test/kernels/glm53/check_mxfp4.py",
+        "test/kernels/glm53/check_multitoken.py",
+        "test/kernels/test_glm53_kernels.py",
+    ]
+    return dict(
+        warmup_replays=args.perf_warmup,
+        graph_steps=1,
+        weight_allocations=1,
+        completion_boundary="max-rank HIP-event full-layer replay",
+        percentile_method="nearest-rank",
+        cache_restore_timed=False,
+        timing_window_unix=[timing_started, timing_ended],
+        kernel_profile_window_unix=[profile_started, profile_ended],
+        correctness="passed",
+        **latency_stats(slowest),
+        samples_max_rank_us=slowest,
+        per_rank=[latency_stats(values) for values in samples_all_ranks],
+        samples_all_ranks_us=samples_all_ranks,
+        kernel_profile_replays=args.perf_kernel_replays,
+        kernel_profile_priming_replays=1,
+        kernel_breakdown=breakdown,
+        source_sha256={
+            name: hashlib.sha256((source_root / name).read_bytes()).hexdigest()
+            for name in sources
+        },
+    )
 
 
 def make_weights(tp, device, ties=False, seed=719, expert_factory=None):

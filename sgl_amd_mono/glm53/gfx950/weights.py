@@ -189,8 +189,8 @@ def _mxfp4_reason(experts) -> Optional[str]:
     if w13.ndim != 3 or w13.shape[0] != PHYSICAL_EXPERTS:
         return "MXFP4 needs 256 routed experts plus one fused shared expert"
     inter = w13.shape[1] // 2
-    if inter != 512:
-        return "SGL native MXFP4 needs the TP4 expert intermediate width 512"
+    if inter not in (256, 512):
+        return "SGL native MXFP4 needs expert intermediate width 512 (TP4) or 256 (TP8)"
     for name, tensor, shape in (
         ("w13_weight", w13, (PHYSICAL_EXPERTS, 2 * inter, HIDDEN // 2)),
         ("w2_weight", w2, (PHYSICAL_EXPERTS, HIDDEN, inter // 2)),
