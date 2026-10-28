@@ -475,3 +475,105 @@ Reproduction commands and per-rank metrics are retained in
 identify the exact production and harness versions. Whole-state validation
 controls and the temporary FlyDSL cache were removed after verification;
 the task container was stopped.
+
+## Device program structure (2026-10-28)
+
+`build_glm5_monokernel` owns the build contract, workspace/fusion plan and task
+placement. `glm5_monokernel` owns the launch guard, CTA workspace allocation and
+row/cohort dispatch. `run_row_tile` takes explicit runtime-input and workspace
+tuples, binds the shared device routines and executes ten named stages. FlyDSL
+inlines these stage calls into the same mono-kernel; they create no additional
+GPU launches. Mailbox epochs govern readiness between CTAs/ranks.
+
+| Stage function | Fused operations | Published boundary |
+| --- | --- | --- |
+| `stage_input_projection` | Input RMSNorm, Q_A/KV_A and optional index K/W | `q_a`, `kv_a`, `index_k`, `index_w` |
+| `stage_query_norm_and_cache` | Q/KV normalization, key RoPE, index K norm/RoPE/Hadamard, cache policy | `q_an`, `kvnew`, `penew`, `index_k_new`, `index_ready` |
+| `stage_query_projection` | Q_B/query RoPE and index Q | `q_nope`, `q_pe`, `index_q` |
+| `stage_key_projection_and_indexer` | Absorbed Q, index Q Hadamard, score, top-k | `q_lat`, physical sparse indices |
+| `stage_sparse_attention` | Causal KV gather/patch, split softmax, reader retirement | Sparse latent partials |
+| `stage_attention_output` | Latent merge, UV/O, attention TP sum and residual | `a` |
+| `stage_router` | Post-attention RMSNorm, activation quantization, sigmoid scores | `xq`, `xqs`, `xqd`, `scores` |
+| `stage_expert_up` | Shared/routed selection, gate/up, SiLU, grouped mid quantization | `mid`, `ugp` |
+| `stage_expert_down` | Mid quantization, down GEMM, route weighting, FFN TP sum and residual | `x_out` |
+| `stage_cache_commit` | Deferred cache commit and serial tile join | KV/PE cache, tile completion |
+
+```mermaid
+flowchart LR
+  A[Input norm + Q_A/KV_A + index K/W] --> B[Q/KV norm + key RoPE + index K cache]
+  B --> C[Q_B + query RoPE + index Q]
+  C --> D[Absorbed Q + optional indexer/top-k]
+  D --> E[Causal sparse attention]
+  E --> F[Merge + UV/O + TP + residual]
+  F --> G[Post norm + quant + router]
+  G --> H[Top-8 + gate/up + SiLU]
+  H --> I[Down + route weighting + TP + residual]
+  I --> J[Deferred cache commit / tile join]
+```
+
+Immediate/deferred cache writes and front/reader joins remain selected by the
+existing build plan. The diagram describes each CTA's stage order; it does not
+introduce a global barrier between stage calls.
+
+Single/two-row router tasks now use one computation specialized by
+`ROUTER_ROWS`. Their normalization, K-fold, activation publication and rank/wave
+addition order are preserved. `stage_barrier(mark)` replaces `hint_wait`: the
+old helper never read its producer count or address callback. Fourteen dead
+address callbacks were removed; the timestamp and CTA barrier remain. Payload
+poll/get operations still verify epoch tags.
+
+Five unreferenced historical helpers were removed: `_qptr`, `_ld_pair`,
+`emit_ptpc_weight`, `quant_block` and `stored_key`. The MoE format flags now have
+one coherence check; all sixteen boolean combinations retain the previous
+accept/reject behavior. Bounds/layout/resource checks, coherent epoch polling,
+causal cache protection and reader retirement remain active.
+
+Validation against frozen commit `05fd312` passed on node 51: 171 CPU checks,
+five TP4 cases and four TP8 A4W4/A8W8 cases. The raw native one-row probe also
+passes ties, quantization edges, FP8 KV, cache/causality and replay checks; its
+profiler records exactly one mono and one epoch-increment kernel per rank.
+Twelve/sixteen-row cross-version controls are bitwise exact. The independent
+relative-L2 bound remains 1e-3, with exact FP4 codes/scales.
+
+The same ABBA setup described above collects 200 maximum-rank replay samples
+per version/case and 40 separate kernel invocations per rank. Whole-layer
+replay statistics are:
+
+| Case | `05fd312` median / P95 (µs) | Stage refactor median / P95 (µs) |
+| --- | ---: | ---: |
+| A4W4 12 rows, external/disjoint | 289.42 / 327.76 | 288.24 / 324.56 |
+| A4W4 16 rows, external/overlap | 235.80 / 294.48 | 231.36 / 269.04 |
+| A8W8 1×4, 128K context | 261.12 / 302.32 | 256.30 / 299.52 |
+
+Separate profiling values below are maximum-rank mean / largest-rank
+invocation P95. Whole-replay and separate profiling have different sampling
+and aggregation boundaries; neither table substitutes for the other.
+
+| Case | Version | Mono kernel (µs) | Epoch increment (µs) |
+| --- | --- | ---: | ---: |
+| A4W4 12 rows | 05fd312 | 281.37 / 331.28 | 3.47 / 3.60 |
+| A4W4 12 rows | Stage refactor | 275.49 / 311.00 | 3.48 / 3.64 |
+| A4W4 16 rows | 05fd312 | 220.00 / 283.80 | 3.46 / 3.60 |
+| A4W4 16 rows | Stage refactor | 221.06 / 270.44 | 3.47 / 3.60 |
+| A8W8 1×4 | 05fd312 | 229.79 / 261.00 | 3.37 / 3.48 |
+| A8W8 1×4 | Stage refactor | 234.70 / 274.76 | 3.43 / 3.48 |
+
+Whole-replay median/P95 show no regression in these cases. Separate profiling
+has a 2.1% higher A8W8 mono mean and 5.3% higher invocation P95; the data do not
+isolate a cause or establish a per-stage speedup. Internal fused stage times
+are not inferred from the mono/epoch events.
+
+The refactor removes 82 net lines from `kernel.py` (9,851 → 9,769), while
+adding explicit stage boundaries and runtime bindings. The launch body is 76
+lines. Stage extraction/state binding preserve the flattened executable AST;
+router merging is checked with the independent golden and exact GPU controls.
+Final stage/mailbox description corrections change docstrings only and retain
+an identical executable AST.
+
+Commands, source hashes, per-rank metrics and logs are under
+`/shared/amdgpu/home/jiahao_zhou_qle/hzm/sgl_glm_structure_20261028` in
+`refactor_final.summary.json` and `run_structure.py`. The tested candidate is
+retained separately from the final documented `kernel.py`, with the docstring
+hash delta recorded. Validation controls and the temporary compile cache were
+removed after verification. No new repository test scripts or E2E cases were
+added.
