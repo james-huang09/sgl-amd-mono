@@ -1477,22 +1477,45 @@ def build_glm5_monokernel(
                 )
                 return ("native_mxfp4", (raw, scale, b_scale_word), coef, b_word)
 
-            def lds_mxfp8(chunk_word):
+            def lds_mxfp8(chunk_word, base=xs):
                 """One scaled-MFMA B operand from a row-major 128-value MXFP8 tile."""
                 if const_expr(activation_fp4):
                     # FP4 uses contiguous K[32*g:32*g+32] for lane group g.
                     return fx.ptr_load(
-                        xs + chunk_word + 4 * (lane // 16), result_type=v4f
+                        base + chunk_word + 4 * (lane // 16), result_type=v4f
                     ).bitcast(fx.Int32)
                 words = [
                     fx.ptr_load(
-                        xs + chunk_word + 16 * half + 4 * (lane // 16),
+                        base + chunk_word + 16 * half + 4 * (lane // 16),
                         result_type=v4f,
                     ).bitcast(fx.Int32)
                     for half in range(2)
                 ]
                 return fx.Vector.from_elements(
                     [words[half][e] for half in range(2) for e in range(4)], fx.Int32
+                )
+
+            def native_mxfp4_partial(weights, b_word, x_base=xs, scale_base=misc):
+                """One native scaled MFMA, shared by ordinary and union down tiles."""
+                raw, weight_scale, activation_scale_word = weights
+                activation_scale = lds_ld(scale_base, activation_scale_word).bitcast(
+                    fx.Int32
+                )
+                return fx.Vector(
+                    rocdl.mfma_scale_f32_16x16x128_f8f6f4(
+                        T.vec(4, T.f32),
+                        [
+                            raw,
+                            lds_mxfp8(b_word, x_base),
+                            fx.full(4, 0.0, fx.Float32),
+                            4,
+                            4 if activation_fp4 else 0,
+                            0,
+                            weight_scale,
+                            0,
+                            activation_scale,
+                        ],
+                    )
                 )
 
             def unit_bf16(w_rsrc, rg, kc, NKC, b_word, ln=None):
@@ -1593,26 +1616,7 @@ def build_glm5_monokernel(
                             )
                         )
                     if const_expr(fmt == "native_mxfp4"):
-                        raw, weight_scale, activation_scale_word = wv
-                        activation_scale = lds_ld(misc, activation_scale_word).bitcast(
-                            fx.Int32
-                        )
-                        c = fx.Vector(
-                            rocdl.mfma_scale_f32_16x16x128_f8f6f4(
-                                T.vec(4, T.f32),
-                                [
-                                    raw,
-                                    lds_mxfp8(bw),
-                                    c,
-                                    4,
-                                    4 if activation_fp4 else 0,
-                                    0,
-                                    weight_scale,
-                                    0,
-                                    activation_scale,
-                                ],
-                            )
-                        )
+                        c = native_mxfp4_partial(wv, bw)
                     if const_expr(fmt in ("ptpc", "ptpc64")):
                         halves64 = 2 if fmt == "ptpc" else 1
                         for half64 in range_constexpr(halves64):
@@ -2188,84 +2192,9 @@ def build_glm5_monokernel(
                 tot = fx.coop.warp_reduce(raw, fx.ReductionOp.ADD, width=8)
                 return e, raw * (_rcp(tot) * ROUTE_SCALE)
 
-            def ffn_owner_reduce(t, residual, out_fn, tile=DN_TILE):
+            def owner_reduce(region, t, residual, out_fn, tile=ROW_TILE):
                 """Gather rounded partials at a tile owner, then broadcast the raw FP32 sum."""
-                region_base = fx.Int64(SY["ffn"]) + fx.Int64(peer_slot) * fx.Int64(
-                    SY["_part_stride"]
-                )
-                owner = t % W
-                owner_words = fx.Vector(
-                    bo.buffer_load(r_peers, owner * 2, vec_width=2, dtype=T.i32)
-                )
-                owner_addr = (
-                    (fx.Int64(_uniform(owner_words[1])) << 32)
-                    | fx.Int64(fx.Uint32(_uniform(owner_words[0])))
-                ) + peer_offset
-                if tid < S * tile // 2:
-                    s = tid // (tile // 2)
-                    r = (tid % (tile // 2)) * 2
-                    put_bf(
-                        owner_addr + region_base,
-                        (rank * S + s) * HIDDEN + t * tile + r,
-                        [lds_ld(outs, s * tile + r), lds_ld(outs, s * tile + r + 1)],
-                        CM_SYS,
-                    )
-                gpu.barrier()
-                if rank == owner:
-                    if tid < S * tile // 2:
-                        s = tid // (tile // 2)
-                        r = (tid % (tile // 2)) * 2
-                        row = t * tile + r
-                        specs = [
-                            (sym + region_base, ((src * S + s) * HIDDEN + row) // 2, 1)
-                            for src in range(W)
-                        ]
-                        got = poll(specs, "system")
-                        parts = [bf2_f32(v[0]) for v in got]
-                        t0, t1 = fx.Float32(0.0), fx.Float32(0.0)
-                        for src in range_constexpr(W):
-                            t0 = t0 + parts[src][0]
-                            t1 = t1 + parts[src][1]
-                        lds_st(outs, s * tile + r, t0)
-                        lds_st(outs, s * tile + r + 1, t1)
-                    gpu.barrier()
-                    if wave < W:
-                        pair_count = S * tile // 2
-                        for batch in range_constexpr((pair_count + 63) // 64):
-                            pair = lane + batch * 64
-                            if pair < pair_count:
-                                s = pair // (tile // 2)
-                                r = (pair % (tile // 2)) * 2
-                                result_base = (
-                                    peer_dst
-                                    + region_base
-                                    + fx.Int64(W * S * HIDDEN * 4)
-                                )
-                                put2(
-                                    result_base,
-                                    s * HIDDEN + t * tile + r,
-                                    lds_ld(outs, s * tile + r),
-                                    lds_ld(outs, s * tile + r + 1),
-                                    CM_SYS,
-                                )
-                gpu.barrier()
-                if tid < S * tile // 2:
-                    s = tid // (tile // 2)
-                    r = (tid % (tile // 2)) * 2
-                    row = t * tile + r
-                    result_base = sym + region_base + fx.Int64(W * S * HIDDEN * 4)
-                    got = poll([(result_base, s * HIDDEN + row, 2)], "system")
-                    r0, r1 = residual(s, row)
-                    out_fn(
-                        s,
-                        row,
-                        r0 + got[0][0].bitcast(fx.Float32),
-                        r1 + got[0][1].bitcast(fx.Float32),
-                    )
-
-            def o_owner_reduce(t, residual, out_fn, tile=ROW_TILE):
-                """Gather rounded partials at a tile owner, then broadcast the raw FP32 sum."""
-                region_base = fx.Int64(SY["attn"]) + fx.Int64(peer_slot) * fx.Int64(
+                region_base = fx.Int64(SY[region]) + fx.Int64(peer_slot) * fx.Int64(
                     SY["_part_stride"]
                 )
                 owner = t % W
@@ -6105,7 +6034,8 @@ def build_glm5_monokernel(
                     return v[0], v[1]
 
                 if const_expr(OWNER_ROUTER_PAIR):
-                    o_owner_reduce(
+                    owner_reduce(
+                        "attn",
                         t,
                         resid_h,
                         lambda s, row, v0, v1: put_bf(
@@ -8239,20 +8169,30 @@ def build_glm5_monokernel(
                         return t == start("down")
                     return fx.Boolean(True)
 
-                def dn_union_tile(t, output_rows=32):
+                def dn_union_compute(
+                    t,
+                    output_rows,
+                    layout,
+                    xs,
+                    misc,
+                    keys,
+                    dnw,
+                    contributions,
+                    down_union_experts,
+                    uc,
+                    slot_lut,
+                    paired=False,
+                ):
+                    """Shared weight/MFMA and ordered reduction for staged union inputs.
 
-                    hidden, INTER, SLOTS = HIDDEN, 512, DU_SLOTS
-                    XROW, SCROW, UNION_MAX = DU_XROW, DU_SCROW, DU_UMAX
-                    MSOFF, KEYOFF, DWOFF = DU_MSOFF, DU_KEYOFF, DU_DWOFF
-                    CROFF, CWORDS = DU_CROFF, DU_CWORDS
+                    Layout constants describe rows, slots, activation/scale strides,
+                    K-chunk words and the final half-tile weight offset. Pair staging
+                    retains its own mailbox mapping and assigns waves within a cohort.
+                    """
+                    hidden, INTER = HIDDEN, 512
+                    ROWS, SLOTS, XROW, SCROW, K_WORDS, FULL_TASKS = layout
                     gu, gw = wave // 4, wave % 4
                     tile = t
-                    arena = lds.work.ptr
-                    old_keys = fx.recast_iter(fx.Int32, arena + KEYS_OFF)
-                    old_dnw = arena + DNW_OFF
-                    xs, misc = arena, arena + MSOFF
-                    keys = fx.recast_iter(fx.Int32, arena + KEYOFF)
-                    dnw, contributions = arena + DWOFF, arena + CROFF
                     red = contributions
 
                     def ld(p, i):
@@ -8266,12 +8206,12 @@ def build_glm5_monokernel(
                             # Preserve the logical (slot, K, row, token) contribution;
                             # keep each lane's four adjacent rows together for float4 I/O.
                             return (
-                                ((slot * 4 + kc) * 8 + row // 4) * S + token
+                                ((slot * 4 + kc) * 8 + row // 4) * ROWS + token
                             ) * 4 + row % 4
-                        return ((slot * 4 + kc) * 32 + row) * S + token
+                        return ((slot * 4 + kc) * 32 + row) * ROWS + token
 
                     def unit(expert, slot, kc, coefficient):
-                        sn = fx.min(lane % 16, S - 1)
+                        sn = fx.min(lane % 16, ROWS - 1)
                         row = sn * SLOTS + slot
                         wb = _rsrc(
                             w_dn + fx.Int64(expert) * fx.Int64(hidden * INTER // 2)
@@ -8282,68 +8222,183 @@ def build_glm5_monokernel(
                         rg = (
                             tile * (output_rows // 16)
                             + gu
-                            + (DN_FULL_TASKS if output_rows == 16 else 0)
+                            + (FULL_TASKS if output_rows == 16 else 0)
                         )
-                        raw = fx.Vector(
-                            bo.buffer_load(
-                                wb,
-                                (rg * 8 + kc * 2) * 128 + lane * 4,
-                                vec_width=4,
-                                dtype=T.i32,
-                            )
-                        )
-                        scale = fx.Int32(
-                            bo.buffer_load(
-                                sb,
-                                atom_mxfp4_scale_index(
-                                    rg * 16 + lane % 16, kc * 4 + lane // 16, 16
-                                ),
-                                vec_width=1,
-                                dtype=T.i8,
-                            )
-                        )
-                        return (
-                            raw,
-                            scale,
-                            row * XROW + kc * 32,
+                        return unit_native_mxfp4(
+                            wb,
+                            sb,
+                            rg,
+                            kc,
+                            INTER,
+                            row * XROW + kc * K_WORDS,
                             row * SCROW + kc * 4 + lane // 16,
                             coefficient,
                         )
 
-                    def partial(u):
-                        raw, scale, bw, sw, coefficient = u
-                        words = [
-                            fx.ptr_load(
-                                xs + bw + 16 * half + 4 * (lane // 16), result_type=v4f
-                            ).bitcast(fx.Int32)
-                            for half in range(2)
-                        ]
-                        b = fx.Vector.from_elements(
-                            [words[half][e] for half in range(2) for e in range(4)],
-                            fx.Int32,
+                    n_union = _uniform(ld(uc, 4))
+
+                    sn = fx.min(lane % 16, ROWS - 1)
+
+                    BATCH = 4
+
+                    if wave < (output_rows // 16) * 4:
+                        for batch in range((n_union + BATCH - 1) // BATCH):
+                            units, slots, active_columns = [], [], []
+                            for part in range_constexpr(BATCH):
+                                union_index = fx.min(batch * BATCH + part, n_union - 1)
+                                expert = _uniform(ld(down_union_experts, union_index))
+                                slot = fx.Int32(ld(slot_lut, expert * ROWS + sn))
+                                slots.append(slot)
+                                active_columns.append(
+                                    (lane % 16 < ROWS)
+                                    & (ld(keys, sn * SLOTS + slot) == expert)
+                                )
+                                units.append(unit(expert, slot, gw, fx.Float32(1.0)))
+                            for part in range_constexpr(BATCH):
+                                if batch * BATCH + part < n_union:
+                                    _, weights, _, b_word = units[part]
+                                    c = native_mxfp4_partial(weights, b_word, xs, misc)
+                                    if active_columns[part]:
+                                        # Adjacent rows use a fixed layout stride.
+                                        # Share their base so the LDS writes can pair.
+                                        row = gu * 16 + lane // 16 * 4
+                                        target = contribution_index(
+                                            sn, slots[part], gw, row
+                                        )
+                                        if const_expr(DN_CONTIG_CONTRIBUTIONS):
+                                            fx.ptr_store(c, contributions + target)
+                                        else:
+                                            stride = ROWS
+                                            for e in range_constexpr(4):
+                                                st(
+                                                    contributions,
+                                                    target + e * stride,
+                                                    c[e],
+                                                )
+
+                    gpu.barrier()
+
+                    acc = fx.full(4, 0.0, fx.Float32)
+
+                    if const_expr(DN_UNION_ROW10):
+                        # S10 assigns 90 contiguous slot/K units to each wave.
+                        # Tokens2/7 cross a wave boundary at slot4, K chunk2.
+                        if lane % 16 < ROWS:
+                            for slot in range_constexpr(SLOTS):
+                                coefficient = ld(dnw, sn * SLOTS + slot)
+                                for kc in range_constexpr(4):
+                                    if ((sn * SLOTS + slot) * 4 + kc) // 90 == gw:
+                                        if const_expr(DN_CONTIG_CONTRIBUTIONS):
+                                            vals = fx.ptr_load(
+                                                contributions
+                                                + contribution_index(
+                                                    sn,
+                                                    slot,
+                                                    kc,
+                                                    gu * 16 + lane // 16 * 4,
+                                                ),
+                                                result_type=v4f,
+                                            )
+                                        else:
+                                            vals = [
+                                                ld(
+                                                    contributions,
+                                                    contribution_index(
+                                                        sn,
+                                                        slot,
+                                                        kc,
+                                                        gu * 16 + lane // 16 * 4 + e,
+                                                    ),
+                                                )
+                                                for e in range(4)
+                                            ]
+                                        acc = fx.Vector.from_elements(
+                                            [
+                                                acc[e] + vals[e] * coefficient
+                                                for e in range(4)
+                                            ],
+                                            fx.Float32,
+                                        )
+                    else:
+                        # Keep the original wave and every slot/K addition order.
+                        samples_per_wave = (
+                            S // 4 if paired else (S // 4 if DN_UNION_ALIGNED else 3)
                         )
-                        if const_expr(activation_fp4):
-                            b = fx.ptr_load(
-                                xs + bw + 4 * (lane // 16), result_type=v4f
-                            ).bitcast(fx.Int32)
-                        asc = ld(misc, sw).bitcast(fx.Int32)
-                        zero = fx.full(4, 0.0, fx.Float32)
-                        return fx.Vector(
-                            rocdl.mfma_scale_f32_16x16x128_f8f6f4(
-                                T.vec(4, T.f32),
-                                [
-                                    raw,
-                                    b,
-                                    zero,
-                                    4,
-                                    4 if activation_fp4 else 0,
-                                    0,
-                                    scale,
-                                    0,
-                                    asc,
-                                ],
+                        owner_token = sn % S if paired else sn
+                        if (
+                            (lane % 16 < ROWS)
+                            & (owner_token // samples_per_wave == gw)
+                            & (gu < output_rows // 16)
+                        ):
+                            for slot in range_constexpr(SLOTS):
+                                coefficient = ld(dnw, sn * SLOTS + slot)
+                                for kc in range_constexpr(4):
+                                    if const_expr(DN_CONTIG_CONTRIBUTIONS):
+                                        vals = fx.ptr_load(
+                                            contributions
+                                            + contribution_index(
+                                                sn, slot, kc, gu * 16 + lane // 16 * 4
+                                            ),
+                                            result_type=v4f,
+                                        )
+                                    else:
+                                        vals = [
+                                            ld(
+                                                contributions,
+                                                contribution_index(
+                                                    sn,
+                                                    slot,
+                                                    kc,
+                                                    gu * 16 + lane // 16 * 4 + e,
+                                                ),
+                                            )
+                                            for e in range(4)
+                                        ]
+                                    acc = fx.Vector.from_elements(
+                                        [
+                                            acc[e] + vals[e] * coefficient
+                                            for e in range(4)
+                                        ],
+                                        fx.Float32,
+                                    )
+
+                    gpu.barrier()
+
+                    fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
+
+                    gpu.barrier()
+
+                    if tid < ROWS * output_rows:
+                        output_row, output_token = tid % output_rows, tid // output_rows
+                        tot = fx.Float32(0.0)
+                        for w in range_constexpr(4):
+                            ww = output_row // 16 * 4 + w
+                            tot = tot + ld(
+                                red,
+                                (ww * 64 + output_token + 16 * ((output_row % 16) // 4))
+                                * 4
+                                + output_row % 4,
                             )
-                        )
+                        lds_st(outs, output_token * output_rows + output_row, tot)
+
+                def dn_union_tile(t, output_rows=32):
+
+                    SLOTS = DU_SLOTS
+                    XROW, SCROW, UNION_MAX = DU_XROW, DU_SCROW, DU_UMAX
+                    MSOFF, KEYOFF, DWOFF = DU_MSOFF, DU_KEYOFF, DU_DWOFF
+                    CROFF, CWORDS = DU_CROFF, DU_CWORDS
+                    arena = lds.work.ptr
+                    old_keys = fx.recast_iter(fx.Int32, arena + KEYS_OFF)
+                    old_dnw = arena + DNW_OFF
+                    xs, misc = arena, arena + MSOFF
+                    keys = fx.recast_iter(fx.Int32, arena + KEYOFF)
+                    dnw, contributions = arena + DWOFF, arena + CROFF
+
+                    def ld(p, i):
+                        return fx.ptr_load(p + i)
+
+                    def st(p, i, v):
+                        fx.ptr_store(v, p + i)
 
                     # Keep union metadata through every output task. Original keys
                     # overlap the LUT and are read only before its first construction.
@@ -8436,147 +8491,19 @@ def build_glm5_monokernel(
                             )
                         gpu.barrier()
 
-                    n_union = _uniform(ld(uc, 4))
-
-                    sn = fx.min(lane % 16, S - 1)
-
-                    BATCH = 4
-
-                    if wave < (output_rows // 16) * 4:
-                        for batch in range((n_union + BATCH - 1) // BATCH):
-                            units, slots, active_columns = [], [], []
-                            for part in range_constexpr(BATCH):
-                                union_index = fx.min(batch * BATCH + part, n_union - 1)
-                                expert = _uniform(ld(down_union_experts, union_index))
-                                slot = fx.Int32(ld(slot_lut, expert * S + sn))
-                                slots.append(slot)
-                                active_columns.append(
-                                    (lane % 16 < S)
-                                    & (ld(keys, sn * SLOTS + slot) == expert)
-                                )
-                                units.append(unit(expert, slot, gw, fx.Float32(1.0)))
-                            for part in range_constexpr(BATCH):
-                                if batch * BATCH + part < n_union:
-                                    c = partial(units[part])
-                                    if active_columns[part]:
-                                        # Adjacent rows use a fixed layout stride.
-                                        # Share their base so the LDS writes can pair.
-                                        row = gu * 16 + lane // 16 * 4
-                                        target = contribution_index(
-                                            sn, slots[part], gw, row
-                                        )
-                                        if const_expr(DN_CONTIG_CONTRIBUTIONS):
-                                            fx.ptr_store(c, contributions + target)
-                                        else:
-                                            stride = S
-                                            for e in range_constexpr(4):
-                                                st(
-                                                    contributions,
-                                                    target + e * stride,
-                                                    c[e],
-                                                )
-
-                    gpu.barrier()
-
-                    acc = fx.full(4, 0.0, fx.Float32)
-
-                    if const_expr(DN_UNION_ROW10):
-                        # S10 assigns 90 contiguous slot/K units to each wave.
-                        # Tokens2/7 cross a wave boundary at slot4, K chunk2.
-                        if lane % 16 < S:
-                            for slot in range_constexpr(SLOTS):
-                                coefficient = ld(dnw, sn * SLOTS + slot)
-                                for kc in range_constexpr(4):
-                                    if ((sn * SLOTS + slot) * 4 + kc) // 90 == gw:
-                                        if const_expr(DN_CONTIG_CONTRIBUTIONS):
-                                            vals = fx.ptr_load(
-                                                contributions
-                                                + contribution_index(
-                                                    sn,
-                                                    slot,
-                                                    kc,
-                                                    gu * 16 + lane // 16 * 4,
-                                                ),
-                                                result_type=v4f,
-                                            )
-                                        else:
-                                            vals = [
-                                                ld(
-                                                    contributions,
-                                                    contribution_index(
-                                                        sn,
-                                                        slot,
-                                                        kc,
-                                                        gu * 16 + lane // 16 * 4 + e,
-                                                    ),
-                                                )
-                                                for e in range(4)
-                                            ]
-                                        acc = fx.Vector.from_elements(
-                                            [
-                                                acc[e] + vals[e] * coefficient
-                                                for e in range(4)
-                                            ],
-                                            fx.Float32,
-                                        )
-                    else:
-                        # Keep the original wave and every slot/K addition order.
-                        samples_per_wave = S // 4 if DN_UNION_ALIGNED else 3
-                        if (
-                            (lane % 16 < S)
-                            & (sn // samples_per_wave == gw)
-                            & (gu < output_rows // 16)
-                        ):
-                            for slot in range_constexpr(SLOTS):
-                                coefficient = ld(dnw, sn * SLOTS + slot)
-                                for kc in range_constexpr(4):
-                                    if const_expr(DN_CONTIG_CONTRIBUTIONS):
-                                        vals = fx.ptr_load(
-                                            contributions
-                                            + contribution_index(
-                                                sn, slot, kc, gu * 16 + lane // 16 * 4
-                                            ),
-                                            result_type=v4f,
-                                        )
-                                    else:
-                                        vals = [
-                                            ld(
-                                                contributions,
-                                                contribution_index(
-                                                    sn,
-                                                    slot,
-                                                    kc,
-                                                    gu * 16 + lane // 16 * 4 + e,
-                                                ),
-                                            )
-                                            for e in range(4)
-                                        ]
-                                    acc = fx.Vector.from_elements(
-                                        [
-                                            acc[e] + vals[e] * coefficient
-                                            for e in range(4)
-                                        ],
-                                        fx.Float32,
-                                    )
-
-                    gpu.barrier()
-
-                    fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
-
-                    gpu.barrier()
-
-                    if tid < S * output_rows:
-                        output_row, output_token = tid % output_rows, tid // output_rows
-                        tot = fx.Float32(0.0)
-                        for w in range_constexpr(4):
-                            ww = output_row // 16 * 4 + w
-                            tot = tot + ld(
-                                red,
-                                (ww * 64 + output_token + 16 * ((output_row % 16) // 4))
-                                * 4
-                                + output_row % 4,
-                            )
-                        lds_st(outs, output_token * output_rows + output_row, tot)
+                    dn_union_compute(
+                        t,
+                        output_rows,
+                        (S, SLOTS, XROW, SCROW, 32, DN_FULL_TASKS),
+                        xs,
+                        misc,
+                        keys,
+                        dnw,
+                        contributions,
+                        down_union_experts,
+                        uc,
+                        slot_lut,
+                    )
 
                     if const_expr(N_DN_TILES > G and not DN_UNION_INPUT_REUSE):
                         # Multiple output tasks reuse this CTA's original route data.
@@ -8678,107 +8605,20 @@ def build_glm5_monokernel(
 
                 def dn_pair_tile(t, output_rows=32):
 
-                    hidden, INTER, SLOTS = HIDDEN, 512, DP_SLOTS
+                    SLOTS = DP_SLOTS
                     XROW, SCROW, UNION_MAX = DP_XROW, DP_SCROW, DP_UMAX
                     MSOFF, KEYOFF, DWOFF = DP_MSOFF, DP_KEYOFF, DP_DWOFF
                     CROFF, CWORDS = DP_CROFF, DP_CWORDS
-                    gu, gw = wave // 4, wave % 4
-                    tile = t
                     arena = lds.work.ptr
                     xs, misc = arena, arena + MSOFF
                     keys = fx.recast_iter(fx.Int32, arena + KEYOFF)
                     dnw, contributions = arena + DWOFF, arena + CROFF
-                    red = contributions
 
                     def ld(p, i):
                         return fx.ptr_load(p + i)
 
                     def st(p, i, v):
                         fx.ptr_store(v, p + i)
-
-                    def contribution_index(token, slot, kc, row):
-                        if const_expr(DN_CONTIG_CONTRIBUTIONS):
-                            # Preserve the logical (slot, K, row, token) contribution;
-                            # keep each lane's four adjacent rows together for float4 I/O.
-                            return (
-                                ((slot * 4 + kc) * 8 + row // 4) * DN_PAIR_ROWS + token
-                            ) * 4 + row % 4
-                        return ((slot * 4 + kc) * 32 + row) * DN_PAIR_ROWS + token
-
-                    def unit(expert, slot, kc, coefficient):
-                        sn = fx.min(lane % 16, DN_PAIR_ROWS - 1)
-                        row = sn * SLOTS + slot
-                        wb = _rsrc(
-                            w_dn + fx.Int64(expert) * fx.Int64(hidden * INTER // 2)
-                        )
-                        sb = _rsrc(
-                            s_dn + fx.Int64(expert) * fx.Int64(hidden * INTER // 32)
-                        )
-                        rg = (
-                            tile * (output_rows // 16)
-                            + gu
-                            + (DN_PAIR_FULL if output_rows == 16 else 0)
-                        )
-                        raw = fx.Vector(
-                            bo.buffer_load(
-                                wb,
-                                (rg * 8 + kc * 2) * 128 + lane * 4,
-                                vec_width=4,
-                                dtype=T.i32,
-                            )
-                        )
-                        scale = fx.Int32(
-                            bo.buffer_load(
-                                sb,
-                                atom_mxfp4_scale_index(
-                                    rg * 16 + lane % 16, kc * 4 + lane // 16, 16
-                                ),
-                                vec_width=1,
-                                dtype=T.i8,
-                            )
-                        )
-                        return (
-                            raw,
-                            scale,
-                            row * XROW + kc * 16,
-                            row * SCROW + kc * 4 + lane // 16,
-                            coefficient,
-                        )
-
-                    def partial(u):
-                        raw, scale, bw, sw, coefficient = u
-                        words = [
-                            fx.ptr_load(
-                                xs + bw + 16 * half + 4 * (lane // 16), result_type=v4f
-                            ).bitcast(fx.Int32)
-                            for half in range(2)
-                        ]
-                        b = fx.Vector.from_elements(
-                            [words[half][e] for half in range(2) for e in range(4)],
-                            fx.Int32,
-                        )
-                        if const_expr(activation_fp4):
-                            b = fx.ptr_load(
-                                xs + bw + 4 * (lane // 16), result_type=v4f
-                            ).bitcast(fx.Int32)
-                        asc = ld(misc, sw).bitcast(fx.Int32)
-                        zero = fx.full(4, 0.0, fx.Float32)
-                        return fx.Vector(
-                            rocdl.mfma_scale_f32_16x16x128_f8f6f4(
-                                T.vec(4, T.f32),
-                                [
-                                    raw,
-                                    b,
-                                    zero,
-                                    4,
-                                    4 if activation_fp4 else 0,
-                                    0,
-                                    scale,
-                                    0,
-                                    asc,
-                                ],
-                            )
-                        )
 
                     # Contributions, metadata restores, LUT rebuilds and TP do not
                     # write this input prefix. Retain it across output task rounds.
@@ -8871,149 +8711,20 @@ def build_glm5_monokernel(
                         )
                     gpu.barrier()
 
-                    n_union = _uniform(ld(uc, 4))
-
-                    sn = fx.min(lane % 16, DN_PAIR_ROWS - 1)
-
-                    BATCH = 4
-
-                    if wave < (output_rows // 16) * 4:
-                        for batch in range((n_union + BATCH - 1) // BATCH):
-                            units, slots, active_columns = [], [], []
-                            for part in range_constexpr(BATCH):
-                                union_index = fx.min(batch * BATCH + part, n_union - 1)
-                                expert = _uniform(ld(down_union_experts, union_index))
-                                slot = fx.Int32(
-                                    ld(slot_lut, expert * DN_PAIR_ROWS + sn)
-                                )
-                                slots.append(slot)
-                                active_columns.append(
-                                    (lane % 16 < DN_PAIR_ROWS)
-                                    & (ld(keys, sn * SLOTS + slot) == expert)
-                                )
-                                units.append(unit(expert, slot, gw, fx.Float32(1.0)))
-                            for part in range_constexpr(BATCH):
-                                if batch * BATCH + part < n_union:
-                                    c = partial(units[part])
-                                    if active_columns[part]:
-                                        # Adjacent rows use a fixed layout stride.
-                                        # Share their base so the LDS writes can pair.
-                                        row = gu * 16 + lane // 16 * 4
-                                        target = contribution_index(
-                                            sn, slots[part], gw, row
-                                        )
-                                        if const_expr(DN_CONTIG_CONTRIBUTIONS):
-                                            fx.ptr_store(c, contributions + target)
-                                        else:
-                                            stride = DN_PAIR_ROWS
-                                            for e in range_constexpr(4):
-                                                st(
-                                                    contributions,
-                                                    target + e * stride,
-                                                    c[e],
-                                                )
-
-                    gpu.barrier()
-
-                    acc = fx.full(4, 0.0, fx.Float32)
-
-                    if const_expr(DN_UNION_ROW10):
-                        # S10 assigns 90 contiguous slot/K units to each wave.
-                        # Tokens2/7 cross a wave boundary at slot4, K chunk2.
-                        if lane % 16 < DN_PAIR_ROWS:
-                            for slot in range_constexpr(SLOTS):
-                                coefficient = ld(dnw, sn * SLOTS + slot)
-                                for kc in range_constexpr(4):
-                                    if ((sn * SLOTS + slot) * 4 + kc) // 90 == gw:
-                                        if const_expr(DN_CONTIG_CONTRIBUTIONS):
-                                            vals = fx.ptr_load(
-                                                contributions
-                                                + contribution_index(
-                                                    sn,
-                                                    slot,
-                                                    kc,
-                                                    gu * 16 + lane // 16 * 4,
-                                                ),
-                                                result_type=v4f,
-                                            )
-                                        else:
-                                            vals = [
-                                                ld(
-                                                    contributions,
-                                                    contribution_index(
-                                                        sn,
-                                                        slot,
-                                                        kc,
-                                                        gu * 16 + lane // 16 * 4 + e,
-                                                    ),
-                                                )
-                                                for e in range(4)
-                                            ]
-                                        acc = fx.Vector.from_elements(
-                                            [
-                                                acc[e] + vals[e] * coefficient
-                                                for e in range(4)
-                                            ],
-                                            fx.Float32,
-                                        )
-                    else:
-                        # Keep the original wave and every slot/K addition order.
-                        samples_per_wave = S // 4
-                        if (
-                            (lane % 16 < DN_PAIR_ROWS)
-                            & ((sn % S) // samples_per_wave == gw)
-                            & (gu < output_rows // 16)
-                        ):
-                            for slot in range_constexpr(SLOTS):
-                                coefficient = ld(dnw, sn * SLOTS + slot)
-                                for kc in range_constexpr(4):
-                                    if const_expr(DN_CONTIG_CONTRIBUTIONS):
-                                        vals = fx.ptr_load(
-                                            contributions
-                                            + contribution_index(
-                                                sn, slot, kc, gu * 16 + lane // 16 * 4
-                                            ),
-                                            result_type=v4f,
-                                        )
-                                    else:
-                                        vals = [
-                                            ld(
-                                                contributions,
-                                                contribution_index(
-                                                    sn,
-                                                    slot,
-                                                    kc,
-                                                    gu * 16 + lane // 16 * 4 + e,
-                                                ),
-                                            )
-                                            for e in range(4)
-                                        ]
-                                    acc = fx.Vector.from_elements(
-                                        [
-                                            acc[e] + vals[e] * coefficient
-                                            for e in range(4)
-                                        ],
-                                        fx.Float32,
-                                    )
-
-                    gpu.barrier()
-
-                    fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
-
-                    gpu.barrier()
-
-                    if tid < DN_PAIR_ROWS * output_rows:
-                        output_row, output_token = tid % output_rows, tid // output_rows
-                        tot = fx.Float32(0.0)
-                        for w in range_constexpr(4):
-                            ww = output_row // 16 * 4 + w
-                            tot = tot + ld(
-                                red,
-                                (ww * 64 + output_token + 16 * ((output_row % 16) // 4))
-                                * 4
-                                + output_row % 4,
-                            )
-                        lds_st(outs, output_token * output_rows + output_row, tot)
+                    dn_union_compute(
+                        t,
+                        output_rows,
+                        (DN_PAIR_ROWS, SLOTS, XROW, SCROW, 16, DN_PAIR_FULL),
+                        xs,
+                        misc,
+                        keys,
+                        dnw,
+                        contributions,
+                        down_union_experts,
+                        uc,
+                        slot_lut,
+                        paired=True,
+                    )
 
                 if const_expr(DN_COHORT_PAIR):
                     pair_keys = fx.recast_iter(fx.Int32, lds.work.ptr + DP_KEYOFF)
@@ -9717,13 +9428,21 @@ def build_glm5_monokernel(
                         ):
                             if const_expr(DN_SPLIT_UNION_TAIL):
                                 if t >= DN_FULL_TASKS:
-                                    ffn_owner_reduce(
-                                        t + DN_FULL_TASKS, residual_a, store_x, tile=16
+                                    owner_reduce(
+                                        "ffn",
+                                        t + DN_FULL_TASKS,
+                                        residual_a,
+                                        store_x,
+                                        tile=16,
                                     )
                                 else:
-                                    ffn_owner_reduce(t, residual_a, store_x)
+                                    owner_reduce(
+                                        "ffn", t, residual_a, store_x, tile=DN_TILE
+                                    )
                             else:
-                                ffn_owner_reduce(t, residual_a, store_x)
+                                owner_reduce(
+                                    "ffn", t, residual_a, store_x, tile=DN_TILE
+                                )
                         else:
                             if const_expr(DN_SPLIT_UNION_TAIL):
                                 if t >= DN_FULL_TASKS:

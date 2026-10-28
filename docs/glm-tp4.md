@@ -399,3 +399,79 @@ Kernel invocation P95 is distinct from whole-replay P95. Fused internal stage
 times are not inferred. Raw metrics, commands, source hashes and exact
 numerical checks are in `a8_latest_one_case.summary.json` under the node 47
 run root `/shared/amdgpu/home/jun_chen2_qle/hzm_work/sgl_a8_upstream_20261028`.
+
+## Shared native FP4 routines (2026-10-28)
+
+The refactor uses `3d01cdf` as the frozen reference. Attention and FFN owner
+reductions now call one `owner_reduce(region, ...)` implementation. The region
+and tile width are compile-time arguments; rank addition order and the
+publish/poll/barrier protocol are preserved.
+
+Union and paired-cohort down tiles share `dn_union_compute`. It issues weights
+through the existing `unit_native_mxfp4`; ordinary MoE and union down both use
+`native_mxfp4_partial` and `lds_mxfp8`. Input staging, mailbox mappings, metadata
+restoration and LUT lifetime remain in the layout-specific callers. Layout
+constants preserve the union's 32-word K stride, the pair's 16-word stride,
+cohort wave ownership and the final 16-row weight-tile offset. Slot, K-chunk
+and wave sums retain their original order.
+
+This removes 281 source lines from `kernel.py` (10,132 → 9,851). Relative to
+the branch merge base `0a107f1`, the kernel's net growth falls from 4,987 to
+4,706 lines. Cumulative touched lines fall from 13,731 to 13,244; ignoring
+whitespace, they fall from 6,193 to 5,958. These counts distinguish source reuse
+from indentation-related diff size. The remaining additions include native
+quantization and the grouped/cohort schedules.
+
+Paired measurements on node 51 GPUs 0–3 use the frozen reference and refactor
+with identical synthetic weights, inputs, cache state and graph organization.
+Each case runs reference → refactor → refactor → reference, with 20 warmups
+and 100 isolated replays per pass. Each table entry pools 200 individual
+maximum-rank replay samples; P95 uses nearest rank. The independent native
+MoE limit remains relative L2 ≤ 1e-3, with exact FP4 codes/scales. Cross-version
+controls additionally require bitwise output, routing, intermediate and cache
+hash equivalence.
+
+| Case | Reference median / P95 (µs) | Refactor median / P95 (µs) |
+| --- | ---: | ---: |
+| A4W4 12 rows, external top-k, disjoint routes, 64-slot cache | 291.56 / 333.16 | 284.66 / 316.16 |
+| A4W4 16 rows, external top-k, overlapping routes, 64-slot cache | 233.44 / 272.60 | 228.48 / 255.88 |
+| A8W8 batch 1 × seq 4, full indexer, 128K context | 268.86 / 318.00 | 266.20 / 307.56 |
+
+These are synthetic single-layer replay measurements. The paired whole-layer replay measurements show
+no regression; it does not isolate the source of the small timing changes.
+
+Separate profiler passes capture 20 isolated replays per rank and pass. The
+following values pool 40 invocations per rank. Each cell is maximum-rank mean
+/ largest-rank invocation P95; it measures each actual GPU kernel separately.
+
+| Case | Version | Mono kernel (µs) | Epoch increment (µs) |
+| --- | --- | ---: | ---: |
+| A4W4 12 rows | Reference | 283.77 / 316.92 | 3.51 / 3.68 |
+| A4W4 12 rows | Refactor | 267.35 / 294.60 | 3.49 / 3.64 |
+| A4W4 16 rows | Reference | 223.00 / 258.40 | 3.39 / 3.60 |
+| A4W4 16 rows | Refactor | 219.38 / 250.08 | 3.36 / 3.60 |
+| A8W8 1×4 | Reference | 240.66 / 292.60 | 3.49 / 3.48 |
+| A8W8 1×4 | Refactor | 237.23 / 266.76 | 3.72 / 6.52 |
+
+Kernel invocation P95 is separate from whole-replay P95. Internal fused stage
+latencies are not inferred from these two GPU kernels.
+
+Final validation on node 51 passed: 171 CPU spec/select/peer checks, all five
+TP4 cases (1×16, 2×8, 4×4, 1×4, 2×4), and four TP8 cases (A4W4/A8W8 batch
+1/2 × seq 4). The 12/16-row cross-version controls are bitwise exact across
+all ranks. Additional native one-row and ten-row probes with tied routes,
+quantization edges, external top-k and FP8 KV passed the original numerical,
+cache, replay and causality gates. Static checks and source-hash verification
+passed. No additional repository test files or E2E cases were introduced.
+
+The serial comparison harness pads a logical one-row group to physical width
+two in both versions. The separate native one-row probe uses physical width
+one. Original repository test scripts remain unchanged.
+
+Reproduction commands and per-rank metrics are retained in
+`refactor_final.summary.json` under
+`/shared/amdgpu/home/jiahao_zhou_qle/hzm/sgl_glm_refactor_20261028`, together with
+`run_refactor_final.py`, `run_refactor_row1.py` and their logs. Source hashes
+identify the exact production and harness versions. Whole-state validation
+controls and the temporary FlyDSL cache were removed after verification;
+the task container was stopped.
